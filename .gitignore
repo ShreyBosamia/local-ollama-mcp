@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+
+.env
+.env.*
+
+local_mcp_eval_report.md
+local_mcp_eval_results.json
+
+.DS_Store
