@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from collections import Counter
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 import json
@@ -489,7 +490,163 @@ def summarize(case_results: list[CaseResult]) -> dict:
     }
 
 
+def latest_outcomes_by_task(records: list[dict]) -> dict[str, dict]:
+    outcomes: dict[str, dict] = {}
+    for record in records:
+        if record.get("record_type") == "outcome" and record.get("task_id"):
+            outcomes[str(record["task_id"])] = record
+    return outcomes
+
+
+def is_safe_to_rely(tool_record: dict, outcome: dict | None) -> str:
+    if outcome is None:
+        return "unlabeled"
+    risk_flags = set(tool_record.get("risk_flags") or [])
+    if outcome.get("outcome") == "useful" and not {"tool_error", "think_leak"} & risk_flags:
+        return "yes"
+    return "no"
+
+
+def evaluate_ledger(path: Path) -> dict:
+    records = server.read_ledger_records(path)
+    tool_records = [record for record in records if record.get("record_type") == "tool_call"]
+    outcomes = latest_outcomes_by_task(records)
+    cases = []
+
+    for record in tool_records:
+        task_id = str(record.get("task_id", ""))
+        outcome = outcomes.get(task_id)
+        token_estimates = record.get("token_estimates") or {}
+        input_tokens = int(token_estimates.get("input") or 0)
+        local_tokens = int(token_estimates.get("local_output") or 0)
+        context_reduction = input_tokens - local_tokens
+        cases.append(
+            {
+                "task_id": task_id,
+                "timestamp": record.get("timestamp"),
+                "tool": record.get("tool_name"),
+                "model": record.get("model"),
+                "recommendation": record.get("recommendation"),
+                "outcome": outcome.get("outcome") if outcome else "unlabeled",
+                "safe_to_rely": is_safe_to_rely(record, outcome),
+                "risk_flags": record.get("risk_flags") or [],
+                "latency_ms": record.get("latency_ms") or 0,
+                "raw_context_tokens_est": input_tokens,
+                "local_output_tokens_est": local_tokens,
+                "estimated_context_reduction": context_reduction,
+                "estimated_context_reduction_pct": round(context_reduction / input_tokens, 3)
+                if input_tokens
+                else 0.0,
+                "accepted_solution_tokens_est": estimate_tokens(str(outcome.get("accepted_solution", "")))
+                if outcome
+                else 0,
+            }
+        )
+
+    input_total = sum(case["raw_context_tokens_est"] for case in cases)
+    local_total = sum(case["local_output_tokens_est"] for case in cases)
+    labeled = [case for case in cases if case["outcome"] != "unlabeled"]
+    safe = [case for case in cases if case["safe_to_rely"] == "yes"]
+    latency_values = [int(case["latency_ms"]) for case in cases if case["latency_ms"]]
+
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "model": server.CODE_MODEL,
+        "num_ctx": server.DEFAULT_NUM_CTX,
+        "method": "captured ledger analysis; token counts are regex estimates",
+        "ledger_path": str(path),
+        "summary": {
+            "record_count": len(records),
+            "tool_record_count": len(tool_records),
+            "outcome_record_count": sum(record.get("record_type") == "outcome" for record in records),
+            "labeled_tool_record_count": len(labeled),
+            "safe_to_rely_count": len(safe),
+            "safe_to_rely_labeled_pct": len(safe) / len(labeled) if labeled else 0.0,
+            "aggregate_raw_context_tokens_est": input_total,
+            "aggregate_local_output_tokens_est": local_total,
+            "aggregate_context_reduction": input_total - local_total,
+            "aggregate_context_reduction_pct": (input_total - local_total) / input_total
+            if input_total
+            else 0.0,
+            "average_latency_ms": round(sum(latency_values) / len(latency_values))
+            if latency_values
+            else 0,
+            "recommendation_counts": dict(Counter(case["recommendation"] for case in cases)),
+            "outcome_counts": dict(Counter(case["outcome"] for case in cases)),
+            "risk_flag_counts": dict(
+                Counter(flag for case in cases for flag in case.get("risk_flags", []))
+            ),
+        },
+        "cases": cases,
+    }
+
+
+def render_ledger_markdown(results: dict) -> str:
+    summary = results["summary"]
+    lines = [
+        "# Local Ollama MCP Ledger Evaluation",
+        "",
+        f"- Generated: `{results['generated_at']}`",
+        f"- Ledger: `{results['ledger_path']}`",
+        f"- Tool records: `{summary['tool_record_count']}`",
+        f"- Labeled tool records: `{summary['labeled_tool_record_count']}`",
+        f"- Safe-to-rely labeled rate: `{summary['safe_to_rely_labeled_pct']:.1%}`",
+        f"- Raw context tokens avoided est: `{summary['aggregate_context_reduction']}`",
+        f"- Aggregate context reduction: `{summary['aggregate_context_reduction_pct']:.1%}`",
+        f"- Local output tokens est: `{summary['aggregate_local_output_tokens_est']}`",
+        f"- Average latency: `{summary['average_latency_ms']} ms`",
+        "",
+        "## Recommendation Counts",
+        "",
+        "```json",
+        json.dumps(summary["recommendation_counts"], indent=2, sort_keys=True),
+        "```",
+        "",
+        "## Outcome Counts",
+        "",
+        "```json",
+        json.dumps(summary["outcome_counts"], indent=2, sort_keys=True),
+        "```",
+        "",
+        "## Captured Cases",
+        "",
+        "| Task ID | Tool | Recommendation | Outcome | Safe To Rely | Reduction | Latency | Risk Flags |",
+        "| --- | --- | --- | --- | --- | ---: | ---: | --- |",
+    ]
+    for case in results["cases"]:
+        risks = ", ".join(case["risk_flags"]) or "-"
+        task_id = str(case["task_id"])[:12]
+        lines.append(
+            "| {task_id} | `{tool}` | `{recommendation}` | `{outcome}` | `{safe}` | {reduction:.0%} | {latency} ms | {risks} |".format(
+                task_id=task_id,
+                tool=case["tool"],
+                recommendation=case["recommendation"],
+                outcome=case["outcome"],
+                safe=case["safe_to_rely"],
+                reduction=case["estimated_context_reduction_pct"],
+                latency=case["latency_ms"],
+                risks=risks,
+            )
+        )
+
+    lines.extend(
+        [
+            "",
+            "## Interpretation",
+            "",
+            "- `safe_to_rely` requires an accepted `useful` outcome and no hard risk flags.",
+            "- Unlabeled records are useful for context-reduction and latency metrics but are not training-ready.",
+            "- Token counts are stable estimates for comparing workflow context size, not provider billing counts.",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
 async def run_eval(args: argparse.Namespace) -> dict:
+    if args.from_ledger:
+        return evaluate_ledger(Path(args.ledger_path) if args.ledger_path else server.ledger_path())
+
     if not args.no_status:
         status_before = await server.local_ollama_status()
     else:
@@ -525,6 +682,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--markdown-name", default="local_mcp_eval_report.md")
     parser.add_argument("--no-warm", action="store_true", help="Skip local_warm_model before cases.")
     parser.add_argument("--no-status", action="store_true", help="Skip local_ollama_status before cases.")
+    parser.add_argument("--from-ledger", action="store_true", help="Analyze captured ledger records instead of running synthetic cases.")
+    parser.add_argument("--ledger-path", default="", help="Ledger path for --from-ledger; defaults to LOCAL_MCP_LEDGER_PATH or .local_ollama_mcp/ledger.jsonl.")
     return parser.parse_args()
 
 
@@ -537,9 +696,27 @@ async def main() -> None:
     json_path = output_dir / args.json_name
     markdown_path = output_dir / args.markdown_name
     json_path.write_text(json.dumps(results, indent=2), encoding="utf-8")
-    markdown_path.write_text(render_markdown(results), encoding="utf-8")
+    markdown = render_ledger_markdown(results) if args.from_ledger else render_markdown(results)
+    markdown_path.write_text(markdown, encoding="utf-8")
 
     summary = results["summary"]
+    if args.from_ledger:
+        print(
+            textwrap.dedent(
+                f"""
+                Wrote {json_path}
+                Wrote {markdown_path}
+
+                Tool records: {summary['tool_record_count']}
+                labeled tool records: {summary['labeled_tool_record_count']}
+                safe to rely: {summary['safe_to_rely_count']}
+                aggregate context reduction: {summary['aggregate_context_reduction_pct']:.1%}
+                average latency: {summary['average_latency_ms']} ms
+                """
+            ).strip()
+        )
+        return
+
     print(
         textwrap.dedent(
             f"""

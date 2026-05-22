@@ -8,5 +8,6 @@ __pycache__/
 
 local_mcp_eval_report.md
 local_mcp_eval_results.json
+.local_ollama_mcp/
 
 .DS_Store
