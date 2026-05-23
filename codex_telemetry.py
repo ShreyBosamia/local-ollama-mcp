@@ -175,6 +175,86 @@ def usage_signature(info: dict[str, Any]) -> str:
     return value_hash(info.get("total_token_usage") or {})
 
 
+def clamp_pct(value: Any) -> float | None:
+    if not isinstance(value, (int, float)):
+        return None
+    return round(max(0.0, min(100.0, float(value))), 3)
+
+
+def first_number(*values: Any) -> float | None:
+    for value in values:
+        if isinstance(value, (int, float)):
+            return float(value)
+    return None
+
+
+def mapping_get(value: Any, key: str) -> Any:
+    return value.get(key) if isinstance(value, dict) else None
+
+
+def normalize_quota(payload: Any) -> tuple[float | None, str]:
+    """
+    Normalize quota payloads without inverting active usage.
+
+    `used_percent` and equivalent names are already terminal-style usage.
+    Only fields explicitly named remaining/balance are converted to used pct.
+    """
+    if isinstance(payload, (int, float)):
+        return clamp_pct(payload), "bare_percent"
+    if isinstance(payload, list):
+        values = [normalize_quota(item)[0] for item in payload]
+        values = [value for value in values if value is not None]
+        return (max(values), "balance_array") if values else (None, "missing")
+    if not isinstance(payload, dict):
+        return None, "missing"
+
+    used = first_number(
+        payload.get("used_percent"),
+        payload.get("usage_percent"),
+        payload.get("used_pct"),
+        payload.get("usage_pct"),
+    )
+    if used is not None:
+        return clamp_pct(used), "used_percent"
+
+    remaining = first_number(
+        payload.get("remaining_percent"),
+        payload.get("remaining_pct"),
+    )
+    if remaining is not None:
+        return clamp_pct(100.0 - remaining), "remaining_percent"
+
+    balance_pct = first_number(payload.get("balance_percent"), payload.get("balance_pct"))
+    if balance_pct is not None:
+        return clamp_pct(100.0 - balance_pct), "balance_percent"
+
+    balance = payload.get("balance")
+    if isinstance(balance, (int, float)):
+        return clamp_pct(100.0 - float(balance)), "balance_percent"
+    if isinstance(balance, (dict, list)):
+        value, source = normalize_quota(balance)
+        if value is None:
+            return None, "missing"
+        if source in {"used_percent", "bare_percent"}:
+            return clamp_pct(100.0 - value), "balance_object"
+        return value, "balance_object"
+
+    return None, "missing"
+
+
+def cache_pressure_level(turn_input_tokens: int, turn_cached_input_tokens: int) -> str:
+    if turn_input_tokens <= 0 or turn_cached_input_tokens <= 0:
+        return "none"
+    ratio = turn_cached_input_tokens / turn_input_tokens
+    if turn_cached_input_tokens >= 250_000:
+        return "high"
+    if ratio >= 0.80 and turn_input_tokens >= 10_000:
+        return "high"
+    if turn_cached_input_tokens >= 100_000 or (ratio >= 0.60 and turn_input_tokens >= 10_000):
+        return "medium"
+    return "low"
+
+
 @dataclass
 class FunctionCall:
     call_id: str
@@ -226,8 +306,75 @@ class JsonlLedger:
 
     def append_result(self, result: ProcessResult) -> None:
         self.append("events.jsonl", result.events)
-        self.append("turns.jsonl", result.turns)
-        self.append("sources.jsonl", result.sources)
+        new_turns, accepted_turn_keys = self._dedupe_turns(result.turns)
+        self.append("turns.jsonl", new_turns)
+        if accepted_turn_keys:
+            self.append(
+                "sources.jsonl",
+                [
+                    source
+                    for source in result.sources
+                    if self._source_turn_key(source) in accepted_turn_keys
+                ],
+            )
+
+    def _existing_turn_keys(self) -> set[tuple[str, str, str, str]]:
+        path = self.telemetry_dir / "turns.jsonl"
+        if not path.exists():
+            return set()
+        keys: set[tuple[str, str, str, str]] = set()
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(row, dict):
+                    key = self._turn_key(row)
+                    if key:
+                        keys.add(key)
+        return keys
+
+    @staticmethod
+    def _turn_key(row: dict[str, Any]) -> tuple[str, str, str, str] | None:
+        signature = row.get("usage_signature")
+        if not signature:
+            return None
+        return (
+            str(row.get("session_file")),
+            str(row.get("thread_id")),
+            str(row.get("turn_id")),
+            str(signature),
+        )
+
+    @staticmethod
+    def _source_turn_key(row: dict[str, Any]) -> tuple[str, str, str, str] | None:
+        signature = row.get("turn_usage_signature")
+        if not signature:
+            return None
+        return (
+            str(row.get("session_file")),
+            str(row.get("thread_id")),
+            str(row.get("turn_id")),
+            str(signature),
+        )
+
+    def _dedupe_turns(
+        self, rows: list[dict[str, Any]]
+    ) -> tuple[list[dict[str, Any]], set[tuple[str, str, str, str]]]:
+        existing = self._existing_turn_keys()
+        accepted: set[tuple[str, str, str, str]] = set()
+        output: list[dict[str, Any]] = []
+        for row in rows:
+            key = self._turn_key(row)
+            if key is None:
+                output.append(row)
+                continue
+            if key in existing or key in accepted:
+                continue
+            accepted.add(key)
+            output.append(row)
+        return output, accepted
 
 
 class LocalLedgerIndex:
@@ -299,6 +446,7 @@ class SessionProcessor:
         self.calls: dict[str, FunctionCall] = {}
         self.pending_sources: list[PendingSource] = []
         self.last_usage_signature: str | None = None
+        self.seen_usage_keys: set[tuple[str, str, str, str]] = set()
 
     def process_line(self, line: str, event_seq: int) -> ProcessResult:
         result = ProcessResult()
@@ -334,6 +482,11 @@ class SessionProcessor:
                 return result
 
             current_signature = usage_signature(payload.get("info") or {})
+            usage_key = (str(self.session_file), thread_id, turn_id, current_signature)
+            if usage_key in self.seen_usage_keys:
+                self.last_usage_signature = current_signature
+                return result
+            self.seen_usage_keys.add(usage_key)
             usage_advanced = current_signature != self.last_usage_signature
             self.last_usage_signature = current_signature
             result.turns.append(turn)
@@ -413,13 +566,24 @@ class SessionProcessor:
             return None
 
         input_tokens = int(total.get("input_tokens") or 0)
+        turn_input_tokens = int(delta.get("input_tokens") or 0)
+        cached_input_tokens = int(total.get("cached_input_tokens") or 0)
+        turn_cached_input_tokens = int(delta.get("cached_input_tokens") or 0)
         context_used_pct = (
-            round((input_tokens / int(context_window)) * 100, 3)
+            round((turn_input_tokens / int(context_window)) * 100, 3)
             if isinstance(context_window, int) and context_window > 0
             else None
         )
-        primary = (payload.get("rate_limits") or {}).get("primary") or {}
-        secondary = (payload.get("rate_limits") or {}).get("secondary") or {}
+        rate_limits = payload.get("rate_limits") if isinstance(payload.get("rate_limits"), dict) else {}
+        primary = rate_limits.get("primary") or {}
+        secondary = rate_limits.get("secondary") or {}
+        primary_used, primary_source = normalize_quota(primary)
+        secondary_used, secondary_source = normalize_quota(secondary)
+        cache_ratio = round(turn_cached_input_tokens / turn_input_tokens, 3) if turn_input_tokens else 0.0
+        pressure_level = cache_pressure_level(turn_input_tokens, turn_cached_input_tokens)
+        cache_warnings = []
+        if pressure_level == "high":
+            cache_warnings.append("high_cached_input_turn")
 
         return {
             "record_type": "turn",
@@ -428,30 +592,46 @@ class SessionProcessor:
             "thread_id": thread_id,
             "turn_id": turn_id,
             "event_seq": event_seq,
+            "usage_signature": usage_signature(info),
             "model": self.context.get("model"),
             "reasoning_effort": self.context.get("effort") or self.context.get("reasoning_effort"),
             "mode": self.context.get("mode") or self.context.get("summary"),
             "cwd": self.context.get("cwd"),
             "input_tokens": input_tokens,
-            "cached_input_tokens": int(total.get("cached_input_tokens") or 0),
+            "cached_input_tokens": cached_input_tokens,
             "output_tokens": int(total.get("output_tokens") or 0),
             "reasoning_output_tokens": int(total.get("reasoning_output_tokens") or 0),
             "total_tokens": int(total.get("total_tokens") or 0),
-            "delta_input_tokens": int(delta.get("input_tokens") or 0),
-            "delta_cached_input_tokens": int(delta.get("cached_input_tokens") or 0),
+            "turn_input_tokens": turn_input_tokens,
+            "turn_cached_input_tokens": turn_cached_input_tokens,
+            "turn_output_tokens": int(delta.get("output_tokens") or 0),
+            "turn_reasoning_output_tokens": int(delta.get("reasoning_output_tokens") or 0),
+            "turn_total_tokens": int(delta.get("total_tokens") or 0),
+            "delta_input_tokens": turn_input_tokens,
+            "delta_cached_input_tokens": turn_cached_input_tokens,
             "delta_output_tokens": int(delta.get("output_tokens") or 0),
             "delta_reasoning_output_tokens": int(delta.get("reasoning_output_tokens") or 0),
             "delta_total_tokens": int(delta.get("total_tokens") or 0),
             "context_window": context_window,
             "context_used_pct": context_used_pct,
-            "primary_rate_used_pct": primary.get("used_percent"),
-            "primary_rate_window_minutes": primary.get("window_minutes"),
-            "primary_rate_resets_in_seconds": primary.get("resets_in_seconds"),
-            "primary_rate_reset_at": rate_reset_at(timestamp, primary.get("resets_in_seconds")),
-            "secondary_rate_used_pct": secondary.get("used_percent"),
-            "secondary_rate_window_minutes": secondary.get("window_minutes"),
-            "secondary_rate_resets_in_seconds": secondary.get("resets_in_seconds"),
-            "secondary_rate_reset_at": rate_reset_at(timestamp, secondary.get("resets_in_seconds")),
+            "turn_context_used_pct": context_used_pct,
+            "cached_input_tokens_total": cached_input_tokens,
+            "cached_input_tokens_turn": turn_cached_input_tokens,
+            "cache_ratio_turn": cache_ratio,
+            "cache_pressure_level": pressure_level,
+            "cache_warnings": cache_warnings,
+            "primary_rate_used_pct": primary_used,
+            "primary_rate_source": primary_source,
+            "primary_rate_payload_hash": value_hash(primary),
+            "primary_rate_window_minutes": mapping_get(primary, "window_minutes"),
+            "primary_rate_resets_in_seconds": mapping_get(primary, "resets_in_seconds"),
+            "primary_rate_reset_at": rate_reset_at(timestamp, mapping_get(primary, "resets_in_seconds")),
+            "secondary_rate_used_pct": secondary_used,
+            "secondary_rate_source": secondary_source,
+            "secondary_rate_payload_hash": value_hash(secondary),
+            "secondary_rate_window_minutes": mapping_get(secondary, "window_minutes"),
+            "secondary_rate_resets_in_seconds": mapping_get(secondary, "resets_in_seconds"),
+            "secondary_rate_reset_at": rate_reset_at(timestamp, mapping_get(secondary, "resets_in_seconds")),
             "plan_type": payload.get("plan_type") or info.get("plan_type"),
             "snapshot_kind": "current_final_at_observation",
         }
@@ -467,6 +647,7 @@ class SessionProcessor:
                     "thread_id": turn["thread_id"],
                     "turn_id": turn["turn_id"],
                     "turn_event_seq": turn["event_seq"],
+                    "turn_usage_signature": turn.get("usage_signature"),
                     "source_event_seq": source.event_seq,
                     "source_kind": source.source_kind,
                     "source_ref": source.source_ref,
@@ -584,10 +765,10 @@ def format_echo_line(turn: dict[str, Any], sources: list[dict[str, Any]]) -> str
     secondary_text = f"{secondary:.0f}%" if isinstance(secondary, (int, float)) else "n/a"
     return (
         "codex-telemetry: tokens: "
-        f"in {format_count(turn.get('input_tokens'))} "
-        f"(+{format_count(turn.get('cached_input_tokens'))} cached), "
-        f"out {format_count(turn.get('delta_output_tokens'))}, "
-        f"reason {format_count(turn.get('delta_reasoning_output_tokens'))} | "
+        f"in {format_count(turn.get('turn_input_tokens'))} "
+        f"(+{format_count(turn.get('turn_cached_input_tokens'))} cached), "
+        f"out {format_count(turn.get('turn_output_tokens'))}, "
+        f"reason {format_count(turn.get('turn_reasoning_output_tokens'))} | "
         f"ctx {ctx_text} of {format_count(turn.get('context_window'))} | "
         f"5h {primary_text}, weekly {secondary_text} | "
         f"local saved est {format_count(local_saved)}"

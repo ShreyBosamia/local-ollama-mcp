@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 import json
 from pathlib import Path
 import re
+import subprocess
 import textwrap
 import time
 
@@ -26,6 +27,8 @@ import server
 
 TOKEN_RE = re.compile(r"\w+|[^\w\s]", re.UNICODE)
 THINK_RE = re.compile(r"</?think\b", re.IGNORECASE)
+LOCAL_ROUTING_MIN_TOKENS = 120
+LOCAL_ROUTING_MAX_TOKENS = 4000
 
 CLOUD_ONLY_PROMPT = """You are GPT-5.5/Codex. Complete this coding-assistant task from the raw artifact.
 
@@ -91,10 +94,25 @@ class CaseResult:
     local_output_tokens_est: int
     estimated_cloud_token_reduction: int
     estimated_cloud_token_reduction_pct: float
+    routing_decision: str
+    confidence_score: float
+    artifact_tokens_est: int
+    cloud_tokens_avoided_est: int
     compression_ratio: float
     latency_ms: int
     output_preview: str
     local_output: str
+
+
+@dataclass(frozen=True)
+class RoutingResult:
+    routing_decision: str
+    confidence_score: float
+    artifact_tokens_est: int
+    local_output_tokens_est: int
+    cloud_tokens_avoided_est: int
+    risk_flags: tuple[str, ...]
+    reduction_pct: float
 
 
 def estimate_tokens(text: str) -> int:
@@ -111,6 +129,60 @@ def fact_hit(output: str, fact: ExpectedFact) -> bool:
     return re.search(fact.pattern, output, re.IGNORECASE | re.DOTALL) is not None
 
 
+def route_local_artifact(
+    *,
+    artifact: str,
+    local_output: str,
+    required_facts_hit: int,
+    required_facts_total: int,
+    forbidden_facts_hit: int = 0,
+    think_leak: bool = False,
+    tool_error: bool = False,
+) -> RoutingResult:
+    artifact_tokens = estimate_tokens(artifact)
+    local_tokens = estimate_tokens(local_output)
+    reduction = artifact_tokens - local_tokens
+    reduction_pct = reduction / artifact_tokens if artifact_tokens else 0.0
+    required_ratio = required_facts_hit / required_facts_total if required_facts_total else 1.0
+    risk_flags: list[str] = []
+    if tool_error:
+        risk_flags.append("tool_error")
+    if think_leak:
+        risk_flags.append("think_leak")
+    if forbidden_facts_hit:
+        risk_flags.append("contradiction")
+    if required_facts_total and required_facts_hit < required_facts_total:
+        risk_flags.append("missing_required_facts")
+
+    hard_risk = bool({"tool_error", "think_leak", "contradiction"} & set(risk_flags))
+    confidence = max(0.0, min(1.0, (required_ratio * 0.75) + (max(0.0, reduction_pct) * 0.25)))
+    if hard_risk:
+        confidence *= 0.25
+    elif "missing_required_facts" in risk_flags:
+        confidence *= 0.65
+
+    if artifact_tokens < LOCAL_ROUTING_MIN_TOKENS:
+        decision = "skip_local"
+    elif artifact_tokens > LOCAL_ROUTING_MAX_TOKENS or hard_risk:
+        decision = "raw_cloud"
+    elif reduction_pct >= 0.40 and required_ratio >= 1.0:
+        decision = "use_local"
+    elif reduction_pct > 0 and local_output.strip():
+        decision = "verify_raw"
+    else:
+        decision = "raw_cloud"
+
+    return RoutingResult(
+        routing_decision=decision,
+        confidence_score=round(confidence, 3),
+        artifact_tokens_est=artifact_tokens,
+        local_output_tokens_est=local_tokens,
+        cloud_tokens_avoided_est=max(0, reduction) if decision == "use_local" else 0,
+        risk_flags=tuple(sorted(set(risk_flags))),
+        reduction_pct=round(reduction_pct, 3),
+    )
+
+
 def classify_result(
     *,
     case: EvalCase,
@@ -121,23 +193,13 @@ def classify_result(
     token_reduction_pct: float,
     forbidden_facts_hit: int,
 ) -> str:
-    if case.expected_recommendation == "skip_local":
-        if token_reduction_pct < 0.20:
-            return "skip_local"
-        if accuracy_score >= 0.80 and not think_leak and forbidden_facts_hit == 0:
-            return "optional_local"
+    artifact_tokens = estimate_tokens(case.artifact)
+    if artifact_tokens < LOCAL_ROUTING_MIN_TOKENS:
         return "skip_local"
-
-    if think_leak:
-        return "raw_cloud"
-    if forbidden_facts_hit:
-        if accuracy_score >= 0.60 and token_reduction_pct > 0:
-            return "verify_raw"
+    if artifact_tokens > LOCAL_ROUTING_MAX_TOKENS or think_leak or forbidden_facts_hit:
         return "raw_cloud"
     if required_facts_total and required_facts_hit < required_facts_total:
-        if accuracy_score >= 0.60 and token_reduction_pct > 0:
-            return "verify_raw"
-        return "raw_cloud"
+        return "verify_raw" if accuracy_score >= 0.60 and token_reduction_pct > 0 else "raw_cloud"
     if token_reduction_pct >= 0.40 and accuracy_score >= 0.80:
         return "use_local"
     if token_reduction_pct > 0 and accuracy_score >= 0.60:
@@ -344,15 +406,15 @@ async def evaluate_case(case: EvalCase) -> CaseResult:
     token_reduction_pct = token_reduction / raw_tokens if raw_tokens else 0.0
     think_leak = THINK_RE.search(output) is not None
 
-    recommendation = classify_result(
-        case=case,
-        accuracy_score=accuracy_score,
+    routing = route_local_artifact(
+        artifact=case.artifact,
+        local_output=output,
         required_facts_hit=required_hits,
         required_facts_total=len(required),
-        think_leak=think_leak,
-        token_reduction_pct=token_reduction_pct,
         forbidden_facts_hit=len(forbidden_hits),
+        think_leak=think_leak,
     )
+    recommendation = routing.routing_decision
 
     return CaseResult(
         name=case.name,
@@ -377,6 +439,10 @@ async def evaluate_case(case: EvalCase) -> CaseResult:
         local_output_tokens_est=local_tokens,
         estimated_cloud_token_reduction=token_reduction,
         estimated_cloud_token_reduction_pct=round(token_reduction_pct, 3),
+        routing_decision=routing.routing_decision,
+        confidence_score=routing.confidence_score,
+        artifact_tokens_est=routing.artifact_tokens_est,
+        cloud_tokens_avoided_est=routing.cloud_tokens_avoided_est,
         compression_ratio=round(assisted_tokens / raw_tokens, 3) if raw_tokens else 0.0,
         latency_ms=latency_ms,
         output_preview=one_line(output),
@@ -416,18 +482,19 @@ def render_markdown(results: dict) -> str:
         "",
         "## Case Results",
         "",
-        "| Case | Tool | Recommendation | Accuracy | Token Reduction | Latency | Missing Required Facts | Risk Flags |",
-        "| --- | --- | --- | ---: | ---: | ---: | --- | --- |",
+        "| Case | Tool | Route | Confidence | Accuracy | Token Reduction | Latency | Missing Required Facts | Risk Flags |",
+        "| --- | --- | --- | ---: | ---: | ---: | ---: | --- | --- |",
     ]
 
     for case in results["cases"]:
         missing = ", ".join(case["missing_required_facts"]) or "-"
         risks = ", ".join(case["forbidden_fact_labels"]) or "-"
         lines.append(
-            "| {name} | `{tool}` | `{recommendation}` | {accuracy:.0%} | {reduction:.0%} | {latency} ms | {missing} | {risks} |".format(
+            "| {name} | `{tool}` | `{recommendation}` | {confidence:.0%} | {accuracy:.0%} | {reduction:.0%} | {latency} ms | {missing} | {risks} |".format(
                 name=case["name"],
                 tool=case["tool"],
                 recommendation=case["recommendation"],
+                confidence=case["confidence_score"],
                 accuracy=case["accuracy_score"],
                 reduction=case["estimated_cloud_token_reduction_pct"],
                 latency=case["latency_ms"],
@@ -445,7 +512,10 @@ def render_markdown(results: dict) -> str:
                 f"- Recommendation: `{case['recommendation']}`",
                 f"- Raw cloud tokens est: `{case['raw_cloud_tokens_est']}`",
                 f"- Assisted cloud tokens est: `{case['assisted_cloud_tokens_est']}`",
+                f"- Artifact tokens est: `{case['artifact_tokens_est']}`",
                 f"- Local output tokens est: `{case['local_output_tokens_est']}`",
+                f"- Cloud tokens avoided est: `{case['cloud_tokens_avoided_est']}`",
+                f"- Confidence score: `{case['confidence_score']}`",
                 "",
                 "```text",
                 case["local_output"].strip(),
@@ -463,6 +533,7 @@ def render_markdown(results: dict) -> str:
             "- `skip_local` means the raw input is small enough that local preprocessing is not worth adding to the workflow.",
             "- Risk flags catch contradictions, generic false positives, or verbose outputs that violate the helper contract.",
             "- Token counts are stable estimates for relative comparison, not billable provider counts.",
+            "- Before large branch pushes or review summaries, route local diffs/logs through `local_code_review` or `local_summarize` and send only accepted local summaries to cloud.",
             "",
         ]
     )
@@ -517,8 +588,8 @@ def evaluate_ledger(path: Path) -> dict:
         task_id = str(record.get("task_id", ""))
         outcome = outcomes.get(task_id)
         token_estimates = record.get("token_estimates") or {}
-        input_tokens = int(token_estimates.get("input") or 0)
-        local_tokens = int(token_estimates.get("local_output") or 0)
+        input_tokens = int(record.get("artifact_tokens_est") or token_estimates.get("input") or 0)
+        local_tokens = int(record.get("local_output_tokens_est") or token_estimates.get("local_output") or 0)
         context_reduction = input_tokens - local_tokens
         cases.append(
             {
@@ -526,7 +597,9 @@ def evaluate_ledger(path: Path) -> dict:
                 "timestamp": record.get("timestamp"),
                 "tool": record.get("tool_name"),
                 "model": record.get("model"),
-                "recommendation": record.get("recommendation"),
+                "recommendation": record.get("routing_decision") or record.get("recommendation"),
+                "routing_decision": record.get("routing_decision") or record.get("recommendation"),
+                "confidence_score": record.get("confidence_score"),
                 "outcome": outcome.get("outcome") if outcome else "unlabeled",
                 "safe_to_rely": is_safe_to_rely(record, outcome),
                 "risk_flags": record.get("risk_flags") or [],
@@ -534,6 +607,7 @@ def evaluate_ledger(path: Path) -> dict:
                 "raw_context_tokens_est": input_tokens,
                 "local_output_tokens_est": local_tokens,
                 "estimated_context_reduction": context_reduction,
+                "cloud_tokens_avoided_est": int(record.get("cloud_tokens_avoided_est") or 0),
                 "estimated_context_reduction_pct": round(context_reduction / input_tokens, 3)
                 if input_tokens
                 else 0.0,
@@ -610,17 +684,22 @@ def render_ledger_markdown(results: dict) -> str:
         "",
         "## Captured Cases",
         "",
-        "| Task ID | Tool | Recommendation | Outcome | Safe To Rely | Reduction | Latency | Risk Flags |",
-        "| --- | --- | --- | --- | --- | ---: | ---: | --- |",
+        "| Task ID | Tool | Route | Confidence | Outcome | Safe To Rely | Reduction | Latency | Risk Flags |",
+        "| --- | --- | --- | ---: | --- | --- | ---: | ---: | --- |",
     ]
     for case in results["cases"]:
         risks = ", ".join(case["risk_flags"]) or "-"
         task_id = str(case["task_id"])[:12]
         lines.append(
-            "| {task_id} | `{tool}` | `{recommendation}` | `{outcome}` | `{safe}` | {reduction:.0%} | {latency} ms | {risks} |".format(
+            "| {task_id} | `{tool}` | `{recommendation}` | {confidence} | `{outcome}` | `{safe}` | {reduction:.0%} | {latency} ms | {risks} |".format(
                 task_id=task_id,
                 tool=case["tool"],
                 recommendation=case["recommendation"],
+                confidence=(
+                    f"{float(case['confidence_score']):.0%}"
+                    if isinstance(case.get("confidence_score"), (int, float))
+                    else "n/a"
+                ),
                 outcome=case["outcome"],
                 safe=case["safe_to_rely"],
                 reduction=case["estimated_context_reduction_pct"],
@@ -637,6 +716,189 @@ def render_ledger_markdown(results: dict) -> str:
             "- `safe_to_rely` requires an accepted `useful` outcome and no hard risk flags.",
             "- Unlabeled records are useful for context-reduction and latency metrics but are not training-ready.",
             "- Token counts are stable estimates for comparing workflow context size, not provider billing counts.",
+            "- Before large branch pushes or review summaries, route local diffs/logs through `local_code_review` or `local_summarize` and send only accepted local summaries to cloud.",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def run_git_command(args: list[str]) -> tuple[bool, str]:
+    try:
+        completed = subprocess.run(
+            ["git", *args],
+            text=True,
+            capture_output=True,
+            timeout=15,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        return False, str(exc)
+    output = (completed.stdout + completed.stderr).strip()
+    return completed.returncode == 0, output
+
+
+def build_routing_artifacts(log_file: Path | None = None) -> list[dict[str, str]]:
+    artifacts: list[dict[str, str]] = []
+    for name, args in (
+        ("git_diff_cached", ["diff", "--cached"]),
+        ("git_diff_worktree", ["diff"]),
+    ):
+        ok, output = run_git_command(args)
+        artifacts.append(
+            {
+                "name": name,
+                "tool": "local_code_review",
+                "artifact": output,
+                "error": "" if ok else output,
+            }
+        )
+    if log_file:
+        try:
+            text = log_file.read_text(encoding="utf-8", errors="replace")
+            artifacts.append(
+                {
+                    "name": f"log_file:{log_file}",
+                    "tool": "local_summarize",
+                    "artifact": "\n".join(text.splitlines()[-200:]),
+                    "error": "",
+                }
+            )
+        except OSError as exc:
+            artifacts.append(
+                {
+                    "name": f"log_file:{log_file}",
+                    "tool": "local_summarize",
+                    "artifact": "",
+                    "error": str(exc),
+                }
+            )
+    return artifacts
+
+
+def synthetic_routing_cases() -> list[dict[str, object]]:
+    sub_4k_diff = "\n".join(
+        [
+            "diff --git a/app.py b/app.py",
+            "@@",
+            "-    total += item.price * item.quantity",
+            "+    total = item.price * item.quantity",
+            "     return total",
+            *[f" context line {index}: unchanged invoice helper" for index in range(180)],
+        ]
+    )
+    oversized_diff = "\n".join(
+        ["diff --git a/huge.py b/huge.py", "@@"] + [f"+value_{index} = {index}" for index in range(4200)]
+    )
+    return [
+        {
+            "name": "synthetic_sub4k_code_review",
+            "tool": "local_code_review",
+            "artifact": sub_4k_diff,
+            "local_output": "Finding: total is overwritten inside the item loop instead of accumulated; verify multi-item invoices.",
+            "required_facts_hit": 1,
+            "required_facts_total": 1,
+            "expected": "use_local",
+        },
+        {
+            "name": "synthetic_oversized_diff",
+            "tool": "local_code_review",
+            "artifact": oversized_diff,
+            "local_output": "Oversized diff should be summarized in smaller chunks before cloud review.",
+            "required_facts_hit": 1,
+            "required_facts_total": 1,
+            "expected": "raw_cloud",
+        },
+    ]
+
+
+def evaluate_routing_artifact(item: dict[str, object]) -> dict[str, object]:
+    artifact = str(item.get("artifact") or "")
+    local_output = str(item.get("local_output") or "")
+    if not local_output and artifact:
+        local_output = one_line(artifact, 400)
+    routing = route_local_artifact(
+        artifact=artifact,
+        local_output=local_output,
+        required_facts_hit=int(item.get("required_facts_hit") or (1 if artifact else 0)),
+        required_facts_total=int(item.get("required_facts_total") or (1 if artifact else 0)),
+        tool_error=bool(item.get("error")),
+    )
+    return {
+        "name": item.get("name"),
+        "tool": item.get("tool"),
+        "routing_decision": routing.routing_decision,
+        "confidence_score": routing.confidence_score,
+        "artifact_tokens_est": routing.artifact_tokens_est,
+        "local_output_tokens_est": routing.local_output_tokens_est,
+        "cloud_tokens_avoided_est": routing.cloud_tokens_avoided_est,
+        "reduction_pct": routing.reduction_pct,
+        "risk_flags": list(routing.risk_flags),
+        "expected": item.get("expected"),
+        "decision_matches_expected": item.get("expected") in {None, routing.routing_decision},
+        "error": item.get("error") or "",
+    }
+
+
+def run_routing_check(args: argparse.Namespace) -> dict:
+    log_file = Path(args.log_file) if args.log_file else None
+    artifacts = build_routing_artifacts(log_file)
+    real_cases = [evaluate_routing_artifact(item) for item in artifacts]
+    synthetic_cases = [evaluate_routing_artifact(item) for item in synthetic_routing_cases()]
+    all_cases = real_cases + synthetic_cases
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "model": server.CODE_MODEL,
+        "num_ctx": server.DEFAULT_NUM_CTX,
+        "method": "deterministic local routing check; does not invoke Ollama",
+        "summary": {
+            "case_count": len(all_cases),
+            "real_artifact_count": len(real_cases),
+            "synthetic_case_count": len(synthetic_cases),
+            "use_local_count": sum(case["routing_decision"] == "use_local" for case in all_cases),
+            "verify_raw_count": sum(case["routing_decision"] == "verify_raw" for case in all_cases),
+            "skip_local_count": sum(case["routing_decision"] == "skip_local" for case in all_cases),
+            "raw_cloud_count": sum(case["routing_decision"] == "raw_cloud" for case in all_cases),
+            "decision_match_count": sum(case["decision_matches_expected"] for case in synthetic_cases),
+        },
+        "cases": all_cases,
+    }
+
+
+def render_routing_markdown(results: dict) -> str:
+    summary = results["summary"]
+    lines = [
+        "# Local Ollama MCP Routing Check",
+        "",
+        f"- Generated: `{results['generated_at']}`",
+        f"- Model: `{results['model']}`",
+        f"- num_ctx: `{results['num_ctx']}`",
+        f"- Cases: `{summary['case_count']}`",
+        f"- Synthetic decision matches: `{summary['decision_match_count']}/{summary['synthetic_case_count']}`",
+        "",
+        "| Case | Tool | Route | Confidence | Artifact Tokens | Local Tokens | Avoided | Risks |",
+        "| --- | --- | --- | ---: | ---: | ---: | ---: | --- |",
+    ]
+    for case in results["cases"]:
+        risks = ", ".join(case["risk_flags"]) or "-"
+        lines.append(
+            "| {name} | `{tool}` | `{route}` | {confidence:.0%} | {artifact} | {local} | {avoided} | {risks} |".format(
+                name=case["name"],
+                tool=case["tool"],
+                route=case["routing_decision"],
+                confidence=case["confidence_score"],
+                artifact=case["artifact_tokens_est"],
+                local=case["local_output_tokens_est"],
+                avoided=case["cloud_tokens_avoided_est"],
+                risks=risks,
+            )
+        )
+    lines.extend(
+        [
+            "",
+            "## Guard",
+            "",
+            "Before large branch pushes or review summaries, route local diffs/logs through `local_code_review` or `local_summarize` and send only accepted local summaries to cloud.",
             "",
         ]
     )
@@ -646,6 +908,8 @@ def render_ledger_markdown(results: dict) -> str:
 async def run_eval(args: argparse.Namespace) -> dict:
     if args.from_ledger:
         return evaluate_ledger(Path(args.ledger_path) if args.ledger_path else server.ledger_path())
+    if args.routing_check:
+        return run_routing_check(args)
 
     if not args.no_status:
         status_before = await server.local_ollama_status()
@@ -684,6 +948,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-status", action="store_true", help="Skip local_ollama_status before cases.")
     parser.add_argument("--from-ledger", action="store_true", help="Analyze captured ledger records instead of running synthetic cases.")
     parser.add_argument("--ledger-path", default="", help="Ledger path for --from-ledger; defaults to LOCAL_MCP_LEDGER_PATH or .local_ollama_mcp/ledger.jsonl.")
+    parser.add_argument("--routing-check", action="store_true", help="Run deterministic local routing checks without invoking Ollama.")
+    parser.add_argument("--log-file", default="", help="Optional recent command/log file to include in --routing-check.")
     return parser.parse_args()
 
 
@@ -696,7 +962,12 @@ async def main() -> None:
     json_path = output_dir / args.json_name
     markdown_path = output_dir / args.markdown_name
     json_path.write_text(json.dumps(results, indent=2), encoding="utf-8")
-    markdown = render_ledger_markdown(results) if args.from_ledger else render_markdown(results)
+    if args.from_ledger:
+        markdown = render_ledger_markdown(results)
+    elif args.routing_check:
+        markdown = render_routing_markdown(results)
+    else:
+        markdown = render_markdown(results)
     markdown_path.write_text(markdown, encoding="utf-8")
 
     summary = results["summary"]
@@ -712,6 +983,23 @@ async def main() -> None:
                 safe to rely: {summary['safe_to_rely_count']}
                 aggregate context reduction: {summary['aggregate_context_reduction_pct']:.1%}
                 average latency: {summary['average_latency_ms']} ms
+                """
+            ).strip()
+        )
+        return
+    if args.routing_check:
+        print(
+            textwrap.dedent(
+                f"""
+                Wrote {json_path}
+                Wrote {markdown_path}
+
+                Cases: {summary['case_count']}
+                use_local: {summary['use_local_count']}
+                verify_raw: {summary['verify_raw_count']}
+                skip_local: {summary['skip_local_count']}
+                raw_cloud: {summary['raw_cloud_count']}
+                synthetic matches: {summary['decision_match_count']}/{summary['synthetic_case_count']}
                 """
             ).strip()
         )

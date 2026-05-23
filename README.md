@@ -80,7 +80,7 @@ Allowed outcomes are `useful`, `needs_raw_verification`, `misleading`, `too_verb
 
 ## Passive Codex Token Telemetry
 
-`codex-telemetry-watcher` records Codex cloud token usage from Codex session JSONL files without asking the model to emit anything. It watches `event_msg` records where `payload.type` is `token_count`, stores exact `total_token_usage` and `last_token_usage` numbers, and joins local MCP outputs to later token turns when a matching local ledger record is available.
+`codex-telemetry-watcher` records Codex cloud token usage from Codex session JSONL files without asking the model to emit anything. It watches `event_msg` records where `payload.type` is `token_count`, stores exact cumulative `total_token_usage` numbers plus turn-local `last_token_usage` snapshots, and joins local MCP outputs to later token turns when a matching local ledger record is available.
 
 Capture is disabled by default:
 
@@ -103,10 +103,12 @@ CODEX_TELEMETRY_CAPTURE=1 CODEX_TELEMETRY_ECHO=1 ./codex-telemetry-watcher
 Telemetry is written under `.local_ollama_mcp/codex_telemetry/`, which is ignored by Git:
 
 - `events.jsonl`: normalized observations with payload hashes.
-- `turns.jsonl`: one row per token-count payload with exact cumulative and delta token fields.
+- `turns.jsonl`: one row per unique token-count payload with exact cumulative token fields, turn-local `turn_*` fields, quota usage provenance, cache pressure diagnostics, and payload hashes.
 - `sources.jsonl`: estimated source attribution for local MCP output, shell output, or unknown function output.
 
-The telemetry ledger stores hashes and token estimates by default, not raw prompt/session text.
+The terminal echo uses turn-local input/cache counts and active quota usage. It does not invert `used_percent`; it only converts fields explicitly named remaining or balance into usage. Multi-million cached-token observations are treated as provider-side cache accounting, not active context size, and high cache pressure is reported as passive diagnostics only.
+
+The telemetry ledger stores hashes and token estimates by default, not raw prompt/session text. Repeated identical token-count snapshots are deduplicated by session, thread, turn, and cumulative usage signature so repeated imports do not create duplicate turn rows or repeated local-savings attribution.
 If no session JSONL files are available, `--tui-log` can recover thread/turn/model lifecycle metadata from `~/.codex/log/codex-tui.log`; it is diagnostic only and never provides token usage.
 
 ## Evaluation
@@ -129,6 +131,16 @@ Analyze captured real-session records without invoking Ollama:
 ```bash
 .venv/bin/python eval_local_mcp.py --from-ledger
 ```
+
+Run deterministic routing checks without invoking Ollama:
+
+```bash
+.venv/bin/python eval_local_mcp.py --routing-check --no-warm
+```
+
+The router marks artifacts under 120 estimated tokens as `skip_local`, diffs/logs from 120 to 4000 tokens as `use_local` only when the local output preserves required facts, avoids hard risk flags, and reduces cloud payload by at least 40%, incomplete but useful output as `verify_raw`, and tool errors, contradictions, think leakage, or oversized artifacts as `raw_cloud`.
+
+Before large branch pushes or review summaries, route local diffs/logs through `local_code_review` or `local_summarize` and send only the accepted local summary to cloud.
 
 Export labeled records for future training or regression evals:
 

@@ -57,6 +57,8 @@ OUTCOME_LABELS = {
     "too_verbose",
     "skip_for_small_context",
 }
+LOCAL_ROUTING_MIN_TOKENS = 120
+LOCAL_ROUTING_MAX_TOKENS = 4000
 
 
 def strip_thinking(content: str) -> str:
@@ -163,16 +165,35 @@ def recommendation_for_capture(
     if "tool_error" in risk_flags or output_tokens == 0:
         return "raw_cloud"
     if "think_leak" in risk_flags:
-        return "needs_raw_verification"
-    if input_tokens < 120:
-        return "skip_for_small_context"
+        return "verify_raw"
+    if input_tokens < LOCAL_ROUTING_MIN_TOKENS:
+        return "skip_local"
+    if input_tokens > LOCAL_ROUTING_MAX_TOKENS:
+        return "raw_cloud"
 
     reduction_pct = (input_tokens - output_tokens) / input_tokens if input_tokens else 0.0
     if reduction_pct >= 0.40:
         return "use_local"
     if reduction_pct > 0:
-        return "needs_raw_verification"
-    return "skip_for_small_context"
+        return "verify_raw"
+    return "raw_cloud"
+
+
+def confidence_score_for_capture(
+    *,
+    input_tokens: int,
+    output_tokens: int,
+    risk_flags: list[str],
+) -> float:
+    if input_tokens <= 0 or "tool_error" in risk_flags or output_tokens == 0:
+        return 0.0
+    reduction_pct = max(0.0, (input_tokens - output_tokens) / input_tokens)
+    score = min(1.0, 0.45 + reduction_pct)
+    if "think_leak" in risk_flags:
+        score -= 0.45
+    if "empty_output" in risk_flags:
+        score -= 0.45
+    return round(max(0.0, score), 3)
 
 
 def append_ledger_record(record: dict[str, Any]) -> None:
@@ -208,6 +229,12 @@ def build_tool_record(
         risk_flags.append("tool_error")
 
     risk_flags = sorted(set(risk_flags))
+    routing_decision = recommendation_for_capture(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        risk_flags=risk_flags,
+    )
+    cloud_tokens_avoided = max(0, input_tokens - output_tokens) if routing_decision == "use_local" else 0
     return {
         "record_type": "tool_call",
         "task_id": task_id,
@@ -226,11 +253,16 @@ def build_tool_record(
             if input_tokens
             else 0.0,
         },
-        "recommendation": recommendation_for_capture(
+        "recommendation": routing_decision,
+        "routing_decision": routing_decision,
+        "confidence_score": confidence_score_for_capture(
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             risk_flags=risk_flags,
         ),
+        "artifact_tokens_est": input_tokens,
+        "local_output_tokens_est": output_tokens,
+        "cloud_tokens_avoided_est": cloud_tokens_avoided,
         "risk_flags": risk_flags,
         "error": stored_error,
     }
