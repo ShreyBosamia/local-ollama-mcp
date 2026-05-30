@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+source_path="${BASH_SOURCE[0]}"
+while [ -L "$source_path" ]; do
+  source_dir="$(cd -P "$(dirname "$source_path")" >/dev/null 2>&1 && pwd)"
+  link_target="$(readlink "$source_path")"
+  case "$link_target" in
+    /*) source_path="$link_target" ;;
+    *) source_path="$source_dir/$link_target" ;;
+  esac
+done
+
+repo_root="$(cd -P "$(dirname "$source_path")" >/dev/null 2>&1 && pwd)"
+python_bin="$repo_root/.venv/bin/python"
+if [ ! -x "$python_bin" ]; then
+  python_bin="python3"
+fi
+
+export CODEX_TELEMETRY_CAPTURE="${CODEX_TELEMETRY_CAPTURE:-1}"
+export CODEX_TELEMETRY_ECHO="${CODEX_TELEMETRY_ECHO:-1}"
+export CODEX_TELEMETRY_COLOR="${CODEX_TELEMETRY_COLOR:-1}"
+export LOCAL_MCP_CAPTURE="${LOCAL_MCP_CAPTURE:-1}"
+export CODEX_TELEMETRY_DIR="${CODEX_TELEMETRY_DIR:-$repo_root/.local_ollama_mcp/codex_telemetry}"
+export LOCAL_MCP_LEDGER_PATH="${LOCAL_MCP_LEDGER_PATH:-$repo_root/.local_ollama_mcp/ledger.jsonl}"
+
+exec "$python_bin" "$repo_root/codex_telemetry.py" \
+  --local-mcp-ledger "$LOCAL_MCP_LEDGER_PATH" \
+  "$@"

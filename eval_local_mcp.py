@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Evaluate qwen2.5-coder:7b-instruct-q5_K_M as a local MCP helper for Codex.
+Evaluate the configured local MCP helper model for Codex.
 
 The harness is intentionally self-contained: it calls the existing server.py
 helpers directly, scores local outputs against expert baseline facts, and
@@ -29,6 +29,12 @@ TOKEN_RE = re.compile(r"\w+|[^\w\s]", re.UNICODE)
 THINK_RE = re.compile(r"</?think\b", re.IGNORECASE)
 LOCAL_ROUTING_MIN_TOKENS = 120
 LOCAL_ROUTING_MAX_TOKENS = 4000
+DEFAULT_RUN_INDEX = ".local_ollama_mcp/eval_runs/index.jsonl"
+DEFAULT_CASE_DIR = ".local_ollama_mcp/eval_cases"
+DEFAULT_ARTIFACT_DIR = ".local_ollama_mcp/eval_artifacts"
+DEFAULT_DASHBOARD_PATH = "EVAL_DASHBOARD.md"
+SUITES = ("synthetic", "reasoning", "artifacts", "pipeline", "standard", "all")
+
 
 CLOUD_ONLY_PROMPT = """You are GPT-5.5/Codex. Complete this coding-assistant task from the raw artifact.
 
@@ -65,10 +71,15 @@ class EvalCase:
     task: str
     artifact: str
     expected_facts: tuple[ExpectedFact, ...]
+    source: str = "built_in"
     focus: str = ""
     test_framework: str = "unknown"
-    expected_recommendation: str = "use_local"
+    expected_recommendation: str = ""
     forbidden_facts: tuple[ExpectedFact, ...] = ()
+    max_output_tokens: int = 0
+    max_output_chars: int = 0
+    max_bullets: int = 0
+    require_json: bool = False
 
 
 @dataclass
@@ -76,10 +87,15 @@ class CaseResult:
     name: str
     category: str
     tool: str
+    model: str
+    source: str
     recommendation: str
     expected_recommendation: str
     decision_matches_expected: bool
     accuracy_score: float
+    structure_score: float
+    compression_score: float
+    usefulness_score: float
     required_facts_hit: int
     required_facts_total: int
     optional_facts_hit: int
@@ -88,6 +104,7 @@ class CaseResult:
     forbidden_fact_labels: list[str]
     missing_required_facts: list[str]
     missing_optional_facts: list[str]
+    structure_violations: list[str]
     think_leak: bool
     raw_cloud_tokens_est: int
     assisted_cloud_tokens_est: int
@@ -100,8 +117,12 @@ class CaseResult:
     cloud_tokens_avoided_est: int
     compression_ratio: float
     latency_ms: int
+    tokens_per_second: float
+    local_judge_score: float | None
+    local_judge_notes: str
     output_preview: str
     local_output: str
+
 
 
 @dataclass(frozen=True)
@@ -125,8 +146,79 @@ def one_line(text: str, limit: int = 240) -> str:
     return compact if len(compact) <= limit else compact[: limit - 3] + "..."
 
 
+def clamp(value: float, low: float = 0.0, high: float = 1.0) -> float:
+    return max(low, min(high, value))
+
+
 def fact_hit(output: str, fact: ExpectedFact) -> bool:
     return re.search(fact.pattern, output, re.IGNORECASE | re.DOTALL) is not None
+
+
+def tool_model(tool: str) -> str:
+    if tool == "local_reason_check":
+        return server.REASON_MODEL
+    if tool == "local_plan_check":
+        return server.PLAN_MODEL
+    return server.CODE_MODEL
+
+
+def bullet_count(text: str) -> int:
+    count = 0
+    for line in text.splitlines():
+        if re.match(r"^\s*(?:[-*+]|\d+[.)])\s+", line):
+            count += 1
+    return count
+
+
+def structure_result(output: str, case: EvalCase) -> tuple[float, list[str], bool]:
+    violations: list[str] = []
+    think_leak = THINK_RE.search(output) is not None
+    if think_leak:
+        violations.append("think_leak")
+    if not output.strip():
+        violations.append("empty_output")
+    output_tokens = estimate_tokens(output)
+    if case.max_output_tokens and output_tokens > case.max_output_tokens:
+        violations.append(f"max_output_tokens:{output_tokens}>{case.max_output_tokens}")
+    if case.max_output_chars and len(output) > case.max_output_chars:
+        violations.append(f"max_output_chars:{len(output)}>{case.max_output_chars}")
+    if case.max_bullets:
+        count = bullet_count(output)
+        if count > case.max_bullets:
+            violations.append(f"max_bullets:{count}>{case.max_bullets}")
+    if case.require_json:
+        try:
+            json.loads(output)
+        except json.JSONDecodeError:
+            violations.append("invalid_json")
+
+    if think_leak or "empty_output" in violations:
+        return 0.0, violations, think_leak
+    score = 1.0 - (0.18 * len(violations))
+    return round(clamp(score), 3), violations, think_leak
+
+
+def compression_score_for(raw_tokens: int, assisted_tokens: int) -> float:
+    if raw_tokens <= 0:
+        return 0.0
+    reduction_pct = (raw_tokens - assisted_tokens) / raw_tokens
+    return round(clamp(reduction_pct / 0.40), 3)
+
+
+def usefulness_score_for(
+    *,
+    accuracy_score: float,
+    structure_score: float,
+    compression_score: float,
+    forbidden_facts_hit: int,
+    think_leak: bool,
+) -> float:
+    score = (accuracy_score * 0.55) + (structure_score * 0.25) + (compression_score * 0.20)
+    if forbidden_facts_hit:
+        score *= 0.35
+    if think_leak:
+        score = 0.0
+    return round(clamp(score), 3)
 
 
 def route_local_artifact(
@@ -298,6 +390,9 @@ ERROR pipeline/findhelpDirectory.ts:91 directory_expansion capped at 50 provider
             task="Summarize implementation details Codex must preserve while editing the local Ollama MCP server.",
             artifact=server_diff,
             focus="implementation details Codex would need to preserve while editing",
+            expected_recommendation="use_local",
+            max_bullets=6,
+            max_output_tokens=220,
             expected_facts=(
                 ExpectedFact("num_ctx reduced to 4096", r"4096|num_ctx"),
                 ExpectedFact("num_predict added or capped", r"num_predict|predict"),
@@ -315,6 +410,9 @@ ERROR pipeline/findhelpDirectory.ts:91 directory_expansion capped at 50 provider
             task="Review the diff for likely bugs and identify the most important regression.",
             artifact=total_diff,
             focus="bugs and regressions",
+            expected_recommendation="use_local",
+            max_bullets=5,
+            max_output_tokens=280,
             expected_facts=(
                 ExpectedFact("total is overwritten instead of accumulated", r"overwrit|reset|replace|accumulat|\+=|total\s*="),
                 ExpectedFact("loop or multiple items affected", r"loop|item|multiple|last"),
@@ -332,6 +430,9 @@ ERROR pipeline/findhelpDirectory.ts:91 directory_expansion capped at 50 provider
             task="Generate concise test ideas for parse_retry_after.",
             artifact=retry_after_code,
             test_framework="pytest",
+            expected_recommendation="use_local",
+            max_bullets=7,
+            max_output_tokens=260,
             expected_facts=(
                 ExpectedFact("numeric seconds case", r"numeric|digit|seconds|integer"),
                 ExpectedFact("HTTP date future case", r"future|date|parsedate|HTTP"),
@@ -349,6 +450,9 @@ ERROR pipeline/findhelpDirectory.ts:91 directory_expansion capped at 50 provider
             task="Compress noisy logs while preserving exact actionable errors and affected files.",
             artifact=noisy_logs,
             focus="exact errors, affected files, and repeated noise to ignore",
+            expected_recommendation="use_local",
+            max_bullets=6,
+            max_output_tokens=240,
             expected_facts=(
                 ExpectedFact("Place is required exact error", r"Place is required"),
                 ExpectedFact("DialogTitle accessibility warning", r"DialogTitle|accessibility"),
@@ -364,6 +468,8 @@ ERROR pipeline/findhelpDirectory.ts:91 directory_expansion capped at 50 provider
             artifact=small_code,
             focus="implementation behavior",
             expected_recommendation="skip_local",
+            max_bullets=6,
+            max_output_tokens=120,
             expected_facts=(
                 ExpectedFact("addition behavior", r"add|sum|\+"),
             ),
@@ -371,20 +477,570 @@ ERROR pipeline/findhelpDirectory.ts:91 directory_expansion capped at 50 provider
     ]
 
 
+def build_reasoning_cases() -> list[EvalCase]:
+    noisy_problem = "\n".join(
+        [
+            "Provider import failed after a UI review approval.",
+            "INFO retrying provider import",
+            "ERROR service.py:218 Place is required.",
+            "WARN ui/DialogContent.tsx:44 DialogContent requires a DialogTitle for accessibility.",
+            "ERROR pipeline/findhelpDirectory.ts:91 directory_expansion capped at 50 provider candidates",
+            *[f"DEBUG duplicate retry line {index}" for index in range(90)],
+        ]
+    )
+    return [
+        EvalCase(
+            name="deepseek_reasoning_think_strip",
+            category="reasoning",
+            tool="local_reason_check",
+            task="Ask DeepSeek-R1 for concise next checks without exposing hidden reasoning.",
+            artifact=noisy_problem,
+            expected_recommendation="use_local",
+            max_bullets=5,
+            max_output_tokens=220,
+            expected_facts=(
+                ExpectedFact("Place is required remains visible", r"Place is required|place"),
+                ExpectedFact("DialogTitle warning remains visible", r"DialogTitle|accessib"),
+                ExpectedFact("directory expansion cap remains visible", r"directory_expansion|cap|50"),
+            ),
+            forbidden_facts=(
+                ExpectedFact("think tag leaked", r"</?think\b"),
+            ),
+        )
+    ]
+
+
+def build_pipeline_cases() -> list[EvalCase]:
+    # 1. React Component Tree Refactoring & Prop-Drill Auditing case
+    react_noise = "\n".join(
+        f"    // Section block {i} representing nested dashboard layouts and static markup bloat\n"
+        f"    const renderContentBlock_{i} = () => <div className=\"p-4 border\">Static Block {i}</div>;"
+        for i in range(1, 100)
+    )
+    react_artifact = f"""import React, {{ useState, useEffect, useContext, createContext }} from 'react';
+import {{ AuthContext }} from '../context/AuthContext';
+
+interface DashboardProps {{
+    userId: string;
+    theme: 'dark' | 'light';
+    onLogout: () => void;
+}}
+
+interface Metric {{
+    id: string;
+    label: string;
+    value: number;
+    delta: number;
+}}
+
+export const DashboardView: React.FC<DashboardProps> = ({{ userId, theme, onLogout }}) => {{
+    const auth = useContext(AuthContext);
+    const [metricsData, setMetricsData] = useState<Metric[]>([]);
+    const [activeTab, setActiveTab] = useState<string>('overview');
+
+{react_noise}
+
+    return (
+        <div>
+            <HeaderSection userId={{userId}} />
+            <ControlPanel activeTab={{activeTab}} setActiveTab={{setActiveTab}} />
+            <MetricsGrid metricsData={{metricsData}} />
+        </div>
+    );
+}};
+
+const HeaderSection: React.FC<{{ userId: string }}> = ({{ userId }}) => {{
+    return <header>User ID: {{userId}}</header>;
+}};
+
+const ControlPanel: React.FC<{{ activeTab: string; setActiveTab: (tab: string) => void }}> = ({{ activeTab, setActiveTab }}) => {{
+    return <button onClick={{() => setActiveTab('overview')}}>Tab</button>;
+}};
+
+const MetricsGrid: React.FC<{{ metricsData: Metric[] }}> = ({{ metricsData }}) => {{
+    return <div>{{metricsData.map(m => <MetricCard key={{m.id}} metric={{m}} />)}}</div>;
+}};
+
+const MetricCard: React.FC<{{ metric: Metric }}> = ({{ metric }}) => {{
+    return <div>{{metric.label}}: ${{metric.value}} <SparklineChart metricId={{metric.id}} delta={{metric.delta}} /></div>;
+}};
+
+const SparklineChart: React.FC<{{ metricId: string; delta: number }}> = ({{ metricId, delta }}) => {{
+    return <div>Delta: {{delta}}%</div>;
+}};
+"""
+
+    # 2. Vite/Webpack Bundle Audit & Asset Size Bloat Detection case
+    vite_noise = "\n".join(
+        f"dist/assets/chunk-detail-block-{i:03d}-F87d9a8c.js  {0.4 * i:.1f} kB │ gzip: {0.08 * i:.2f} kB"
+        for i in range(1, 100)
+    )
+    vite_artifact = f"""vite v5.2.11 building for production...
+transforming (4512) index.html
+✓ 4810 modules transformed.
+rendering chunks...
+
+{vite_noise}
+
+dist/assets/index-D3g2.js                892.4 kB │ gzip: 184.2 kB
+✓ built asset dist/assets/index-D3g2.js (main app bundle)
+dist/assets/vendor-legacy-F89a.js       1204.8 kB │ gzip: 391.2 kB
+✓ built asset dist/assets/vendor-legacy-F89a.js (compatibility layer)
+
+[warn] 'moment' is imported by 'dist/assets/index-D3g2.js', but is not in vendor config. This creates duplicate packages.
+[warn] Dynamic import of './LazyChart' could not be resolved statically; inlined instead. This spikes chunk sizes.
+[warn] Bundle size exceeds recommended limit of 500 kB. Please split large libraries.
+"""
+
+    # 3. PostgreSQL Lock & Deadlock case
+    pg_noise = "\n".join(
+        f"2026-05-27 19:12:{i%60:02d}.{i*4:03d} UTC [1421] [0x7f83ad29c9] pid={i*10} connection: client connected from 127.0.0.1"
+        for i in range(1, 150)
+    )
+    pg_artifact = f"""{pg_noise}
+2026-05-27 19:15:32.481 UTC [1421] [0x7f83ad29c9] pid=1421 ERROR: deadlock detected
+2026-05-27 19:15:32.481 UTC [1421] [0x7f83ad29c9] pid=1421 DETAIL: Process 1421 waits for ShareLock on transaction 8219318; blocked by process 1429.
+    Process 1429 waits for ExclusiveLock on relation 49210 of database 16384; blocked by process 1421.
+    Process 1421: UPDATE orders SET status = 'completed', updated_at = NOW() WHERE id = 'order_892183';
+    Process 1429: UPDATE inventory SET quantity = quantity - 1 WHERE sku = 'PROD_SKU_8921';
+2026-05-27 19:15:32.482 UTC [1421] [0x7f83ad29c9] pid=1421 STATEMENT: UPDATE orders SET status = 'completed', updated_at = NOW() WHERE id = 'order_892183';
+
+2026-05-27 19:16:01.121 UTC [1433] [0x7f83b248e8] pid=1433 LOG: duration: 4821.192 ms  statement: SELECT * FROM transactions WHERE status = 'pending' AND updated_at < NOW() - INTERVAL '1 day';
+2026-05-27 19:16:01.123 UTC [1433] [0x7f83b248e8] pid=1433 LOG: filter scan node details: Sequential Scan on transactions  (cost=0.00..128912.44 rows=5402123 width=254)
+"""
+
+    # 4. Telemetry Monitor case
+    telemetry_noise = "\n".join(
+        f"2026-05-27T19:20:{i%60:02d}Z - telemetry - [GPU] temperature.gpu=48, power.draw=32.4W, clocks.gr=1350MHz"
+        for i in range(1, 100)
+    )
+    telemetry_artifact = f"""{telemetry_noise}
+2026-05-27T19:25:01Z - telemetry - [WARNING] VRAM utilization has exceeded critical threshold!
+2026-05-27T19:25:01Z - telemetry - [VRAM] memory.total=8192MB, memory.used=7910MB, memory.free=282MB (98.8% allocation)
+2026-05-27T19:25:02Z - ollama - [INFO] loading model qwen2.5-coder:7b-instruct-q5_K_M
+2026-05-27T19:25:05Z - ollama - [WARNING] context limit expanded to 6144. Prompt requires layers offload.
+2026-05-27T19:25:06Z - ollama - [INFO] offloaded 28 / 32 transformer layers to GPU. 4 layers offloaded to system memory (CPU Fallback).
+2026-05-27T19:25:12Z - performance - [METRIC] processing velocity decreased to 8.4 tokens/second (down from 42.0 tok/sec)
+2026-05-27T19:25:20Z - telemetry - [GPU] temperature.gpu=78, power.draw=148.2W, clocks.gr=1860MHz (high thermal profile detected)
+"""
+
+    # 5. External API & Framework documentation case
+    doc_artifact = """
+# Framework Actions API (Beta)
+
+Welcome to the comprehensive installation and API reference guide for modern server-side operations.
+
+![Architecture Diagram](https://raw.githubusercontent.com/framework/actions/main/assets/architecture.svg)
+
+## Quick Start Setup Steps
+1. Prepare node environment and configure package manager.
+- Standard setup list item 1
+- Standard setup list item 2
+- Standard setup list item 3
+- Standard setup list item 4
+- Standard setup list item 5
+- Standard setup list item 6
+- Standard setup list item 7
+- Standard setup list item 8
+- Standard setup list item 9
+- Standard setup list item 10
+- Standard setup list item 11
+
+## API Reference Specifications
+```typescript
+import { createContext } from 'react';
+
+export interface ActionConfig<T> {
+  id: string;
+  resolver: (payload: T) => Promise<ActionResponse>;
+  optimisticUpdate?: (draft: Draft<State>) => void;
+}
+export type ActionResponse = { success: boolean; data?: any; error?: string };
+```
+
+## Hook Method Signatures
+```typescript
+export function useActionState<T>(action: ActionConfig<T>): [State, (payload: T) => void, boolean] {
+  // Complex custom execution state management
+  return [{} as any, () => {}, false];
+}
+```
+"""
+
+    return [
+        EvalCase(
+            name="react_prop_drill_pipeline",
+            category="pipeline",
+            tool="local_summarize",
+            task="map out component parent-child hierarchy, prop drill paths, and state definitions",
+            artifact=react_artifact,
+            focus="map component relations and state",
+            expected_recommendation="use_local",
+            expected_facts=(
+                ExpectedFact("DashboardView component details", r"DashboardView"),
+                ExpectedFact("prop drilling components identified", r"MetricsGrid|MetricCard|SparklineChart|prop[ -]drill"),
+                ExpectedFact("useContext context identified", r"useContext|AuthContext"),
+            ),
+        ),
+        EvalCase(
+            name="vite_bundle_audit_pipeline",
+            category="pipeline",
+            tool="local_summarize",
+            task="summarize Vite bundle bottlenecks, identifying chunks exceeding 500kB and module dependency spikes",
+            artifact=vite_artifact,
+            focus="Vite warnings and large sizes",
+            expected_recommendation="use_local",
+            expected_facts=(
+                ExpectedFact("index-D3g2.js bundle listed", r"index-D3g2\.js|892\.4"),
+                ExpectedFact("vendor-legacy-F89a.js bundle listed", r"vendor-legacy-F89a\.js|1204\.8"),
+                ExpectedFact("moment library duplicate warning", r"moment|duplicate"),
+            ),
+        ),
+        EvalCase(
+            name="postgres_lock_trace_pipeline",
+            category="pipeline",
+            tool="local_summarize",
+            task="identify lock contention patterns, deadlocked tables, and queries triggering sequential scans",
+            artifact=pg_artifact,
+            focus="deadlock details and lock statements",
+            expected_recommendation="use_local",
+            expected_facts=(
+                ExpectedFact("deadlock between processes", r"deadlock|process 1421|process 1429"),
+                ExpectedFact("UPDATE orders SQL blocked statement", r"UPDATE orders"),
+                ExpectedFact("Sequential scan on transactions identified", r"Sequential Scan|Seq Scan|transactions"),
+            ),
+        ),
+        EvalCase(
+            name="telemetry_vram_safety_pipeline",
+            category="pipeline",
+            tool="local_summarize",
+            task="extract telemetry anomalies, VRAM utilization spikes, and GPU model context limits",
+            artifact=telemetry_artifact,
+            focus="VRAM and context limits",
+            expected_recommendation="use_local",
+            expected_facts=(
+                ExpectedFact("VRAM utilization exceeded threshold", r"VRAM|98\.8%|7910"),
+                ExpectedFact("CPU Fallback layers loaded to system memory", r"layers offload|CPU Fallback|system memory"),
+                ExpectedFact("GPU core temperature spiked", r"temperature|78"),
+            ),
+        ),
+        EvalCase(
+            name="framework_api_docs_pipeline",
+            category="pipeline",
+            tool="local_summarize",
+            task="extract public API interfaces, parameter definitions, and usage syntax",
+            artifact=doc_artifact,
+            focus="API configurations and method signatures",
+            expected_recommendation="use_local",
+            expected_facts=(
+                ExpectedFact("ActionConfig interface definition", r"ActionConfig"),
+                ExpectedFact("useActionState method signature", r"useActionState"),
+            ),
+        ),
+    ]
+
+
+def expected_fact_from_dict(raw: dict) -> ExpectedFact:
+    return ExpectedFact(
+        label=str(raw["label"]),
+        pattern=str(raw["pattern"]),
+        required=bool(raw.get("required", True)),
+    )
+
+
+def resolve_artifact_path(raw_path: str, base_dir: Path) -> Path:
+    path = Path(raw_path)
+    if path.is_absolute():
+        return path
+    candidate = base_dir / path
+    if candidate.exists():
+        return candidate
+    return Path.cwd() / path
+
+
+def eval_case_from_dict(raw: dict, base_dir: Path, source: str) -> EvalCase:
+    artifact = str(raw.get("artifact", ""))
+    if raw.get("artifact_path"):
+        artifact_path = resolve_artifact_path(str(raw["artifact_path"]), base_dir)
+        artifact = artifact_path.read_text(encoding="utf-8", errors="replace")
+    expected_facts = tuple(expected_fact_from_dict(item) for item in raw.get("expected_facts", []))
+    forbidden_facts = tuple(expected_fact_from_dict(item) for item in raw.get("forbidden_facts", []))
+    return EvalCase(
+        name=str(raw["name"]),
+        category=str(raw.get("category", "external")),
+        tool=str(raw.get("tool", "local_summarize")),
+        task=str(raw.get("task", "")),
+        artifact=artifact,
+        expected_facts=expected_facts,
+        source=source,
+        focus=str(raw.get("focus", "")),
+        test_framework=str(raw.get("test_framework", "unknown")),
+        expected_recommendation=str(raw.get("expected_recommendation", "")),
+        forbidden_facts=forbidden_facts,
+        max_output_tokens=int(raw.get("max_output_tokens") or 0),
+        max_output_chars=int(raw.get("max_output_chars") or 0),
+        max_bullets=int(raw.get("max_bullets") or 0),
+        require_json=bool(raw.get("require_json", False)),
+    )
+
+
+def load_case_file(path: Path) -> list[EvalCase]:
+    cases: list[EvalCase] = []
+    if not path.exists():
+        return cases
+    with path.open("r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            try:
+                raw = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"{path}:{line_number}: invalid JSONL case: {exc.msg}") from exc
+            cases.append(eval_case_from_dict(raw, path.parent, str(path)))
+    return cases
+
+
+def load_external_cases(args: argparse.Namespace) -> list[EvalCase]:
+    paths: list[Path] = []
+    for case_file in args.case_file:
+        paths.append(Path(case_file))
+    case_dir = Path(args.case_dir)
+    if case_dir.exists():
+        paths.extend(sorted(case_dir.glob("*.jsonl")))
+
+    cases: list[EvalCase] = []
+    seen: set[Path] = set()
+    for path in paths:
+        resolved = path.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        cases.extend(load_case_file(path))
+    return cases
+
+
+def discover_artifact_cases(artifact_dir: Path) -> list[EvalCase]:
+    cases: list[EvalCase] = []
+    diff_dir = artifact_dir / "diffs"
+    if diff_dir.exists():
+        for path in sorted(diff_dir.glob("*.diff")):
+            cases.append(
+                EvalCase(
+                    name=f"artifact_diff_{path.stem}",
+                    category="artifact",
+                    tool="local_code_review",
+                    task="Review this saved git diff for likely regressions.",
+                    artifact=path.read_text(encoding="utf-8", errors="replace"),
+                    expected_facts=(),
+                    source=str(path),
+                    focus="bugs, regressions, missing tests",
+                    max_bullets=5,
+                    max_output_tokens=280,
+                )
+            )
+    log_dir = artifact_dir / "logs"
+    if log_dir.exists():
+        for pattern in ("*.txt", "*.log"):
+            for path in sorted(log_dir.glob(pattern)):
+                cases.append(
+                    EvalCase(
+                        name=f"artifact_log_{path.stem}",
+                        category="artifact",
+                        tool="local_summarize",
+                        task="Summarize this saved terminal log while preserving actionable errors.",
+                        artifact=path.read_text(encoding="utf-8", errors="replace"),
+                        expected_facts=(),
+                        source=str(path),
+                        focus="exact errors, affected files, and repeated noise to ignore",
+                        max_bullets=6,
+                        max_output_tokens=240,
+                    )
+                )
+    return cases
+
+
+def build_suite_cases(args: argparse.Namespace) -> list[EvalCase]:
+    cases: list[EvalCase] = []
+    if args.suite in {"synthetic", "all"}:
+        cases.extend(build_cases())
+    if args.suite in {"reasoning", "all"}:
+        cases.extend(build_reasoning_cases())
+    if args.suite in {"pipeline", "all"}:
+        cases.extend(build_pipeline_cases())
+    if args.suite in {"standard", "all"}:
+        standard_path = Path(__file__).parent / ".local_ollama_mcp" / "eval_cases" / "standard_benchmarks.jsonl"
+        if standard_path.exists():
+            cases.extend(load_case_file(standard_path))
+    if args.suite in {"artifacts", "all"}:
+        cases.extend(load_external_cases(args))
+        cases.extend(discover_artifact_cases(Path(args.artifact_dir)))
+    return cases
+    
+
 async def call_tool(case: EvalCase) -> str:
+    artifact = case.artifact
+    if case.category == "pipeline":
+        if case.name == "react_prop_drill_pipeline":
+            artifact = await server.extract_regex_lines(
+                artifact,
+                pattern=r"(interface|type)\s+\w+Props|const\s+\w+:\s*React\.FC|use(State|Context|Reducer|Memo|Effect)\(",
+                case_insensitive=True,
+                context_lines=2
+            )
+        elif case.name == "vite_bundle_audit_pipeline":
+            artifact = await server.extract_regex_lines(
+                artifact,
+                pattern=r"(?i)warning|chunk|split|\b\d+(\.\d+)?\s*(kB|mB|B)\b|dist/assets/",
+                case_insensitive=True,
+                context_lines=1
+            )
+            artifact = await server.trim_markdown_payload(
+                artifact,
+                max_code_block_lines=8,
+                max_list_items=5,
+                remove_images=True
+            )
+        elif case.name == "postgres_lock_trace_pipeline":
+            artifact = await server.clean_server_logs(
+                artifact,
+                remove_timestamps=True,
+                remove_hex_hashes=True,
+                deduplicate_consecutive=True
+            )
+            artifact = await server.extract_regex_lines(
+                artifact,
+                pattern=r"(?i)deadlock|exclusive\s+lock|lock\s+shared|duration:|seq\s+scan|exceeded\s+threshold",
+                case_insensitive=True,
+                context_lines=3
+            )
+        elif case.name == "telemetry_vram_safety_pipeline":
+            artifact = await server.extract_regex_lines(
+                artifact,
+                pattern=r"(?i)vram|gpu\s+100%|offload|cpu\s+fallback|temperature|exhausted|context\s+limit|oom",
+                case_insensitive=True,
+                context_lines=1
+            )
+            artifact = await server.clean_server_logs(
+                artifact,
+                remove_timestamps=True,
+                remove_hex_hashes=True,
+                deduplicate_consecutive=True
+            )
+        elif case.name == "framework_api_docs_pipeline":
+            artifact = await server.trim_markdown_payload(
+                artifact,
+                max_code_block_lines=8,
+                max_list_items=4,
+                remove_images=True
+            )
+            artifact = await server.extract_regex_lines(
+                artifact,
+                pattern=r"(export\s+(class|interface|type|const|function)|import\s+.*?from)",
+                case_insensitive=False,
+                context_lines=1
+            )
+
     if case.tool == "local_summarize":
-        return await server.local_summarize(case.artifact, focus=case.focus)
+        return await server.local_summarize(artifact, focus=case.focus)
     if case.tool == "local_code_review":
-        return await server.local_code_review(case.artifact, focus=case.focus)
+        return await server.local_code_review(artifact, focus=case.focus)
     if case.tool == "local_test_ideas":
-        return await server.local_test_ideas(case.artifact, test_framework=case.test_framework)
+        return await server.local_test_ideas(artifact, test_framework=case.test_framework)
+    if case.tool == "local_reason_check":
+        return await server.local_reason_check(artifact)
+    if case.tool == "local_map_project_structure":
+        max_depth = int(case.focus) if case.focus.isdigit() else 3
+        return await server.local_map_project_structure(max_depth=max_depth)
+    if case.tool == "local_extract_signatures":
+        return await server.local_extract_signatures(artifact)
+    if case.tool == "local_lint_audit":
+        return await server.local_lint_audit(artifact)
     raise ValueError(f"unknown tool: {case.tool}")
 
 
-async def evaluate_case(case: EvalCase) -> CaseResult:
+
+async def local_judge_case(case: EvalCase, output: str, judge_model: str) -> tuple[float | None, str]:
+    rubric = {
+        "task": case.task,
+        "required_facts": [fact.label for fact in case.expected_facts if fact.required],
+        "forbidden_facts": [fact.label for fact in case.forbidden_facts],
+    }
+    prompt = f"""
+Score this local MCP output as a helper artifact for Codex.
+
+Rubric:
+{json.dumps(rubric, sort_keys=True)}
+
+Factual Coverage: The output should cover the target required facts accurately.
+Conciseness: No preamble, conversational fluff, or chatty introductions.
+Formatting: Output must stay within bounds, utilize simple lists/bullets, or JSON as requested.
+
+Output to evaluate:
+{output}
+
+Return a JSON object matching this schema:
+{{
+  "score": <float between 0.0 and 1.0 representing overall factual coverage and quality>,
+  "notes": "<one short sentence explaining the score rationale>"
+}}
+"""
+    try:
+        raw = await server.ask_ollama(
+            judge_model,
+            prompt,
+            temperature=0,
+            num_predict=200,
+            num_ctx=server.DEFAULT_NUM_CTX,
+            keep_alive="0",
+            system="You are an expert AI system judge. Return strict JSON only. Do not include markdown code block syntax. Do not include conversational text or chain-of-thought thinking.",
+        )
+        
+        # Self-correcting JSON parser: strip markdown code blocks and reasoning tags
+        clean_raw = raw.strip()
+        if "</think>" in clean_raw:
+            clean_raw = clean_raw.split("</think>")[-1].strip()
+        if "```json" in clean_raw:
+            clean_raw = clean_raw.split("```json")[-1].split("```")[0].strip()
+        elif "```" in clean_raw:
+            clean_raw = clean_raw.split("```")[-1].split("```")[0].strip()
+
+        try:
+            parsed = json.loads(clean_raw)
+        except json.JSONDecodeError:
+            # Absolute fallback using regex to parse score and notes from malformed string
+            score_match = re.search(r'"score"\s*:\s*([0-9.]+)', clean_raw)
+            notes_match = re.search(r'"notes"\s*:\s*"([^"]+)"', clean_raw)
+            if score_match:
+                parsed = {
+                    "score": float(score_match.group(1)),
+                    "notes": notes_match.group(1) if notes_match else "Fallback parsed"
+                }
+            else:
+                raise ValueError("Regex parse failed")
+                
+    except Exception as exc:
+        return None, f"local judge unavailable: {type(exc).__name__}: {exc}"
+
+    score = parsed.get("score")
+    notes = str(parsed.get("notes", "")).strip()
+    if not isinstance(score, (int, float)):
+        return None, "local judge returned non-numeric score"
+    return round(clamp(float(score)), 3), one_line(notes, 160)
+
+
+async def evaluate_case(
+    case: EvalCase,
+    *,
+    use_local_judge: bool = False,
+    judge_model: str = "",
+) -> CaseResult:
     started = time.perf_counter()
     output = await call_tool(case)
     latency_ms = round((time.perf_counter() - started) * 1000)
+    local_tokens = estimate_tokens(output)
+    latency_sec = latency_ms / 1000.0
+    tokens_per_second = round(local_tokens / latency_sec, 2) if latency_sec > 0.0 else 0.0
 
     required = [fact for fact in case.expected_facts if fact.required]
     optional = [fact for fact in case.expected_facts if not fact.required]
@@ -401,10 +1057,17 @@ async def evaluate_case(case: EvalCase) -> CaseResult:
     assisted_cloud = LOCAL_ASSISTED_PROMPT.format(task=case.task, local_output=output)
     raw_tokens = estimate_tokens(raw_cloud)
     assisted_tokens = estimate_tokens(assisted_cloud)
-    local_tokens = estimate_tokens(output)
     token_reduction = raw_tokens - assisted_tokens
     token_reduction_pct = token_reduction / raw_tokens if raw_tokens else 0.0
-    think_leak = THINK_RE.search(output) is not None
+    structure_score, structure_violations, think_leak = structure_result(output, case)
+    compression_score = compression_score_for(raw_tokens, assisted_tokens)
+    usefulness_score = usefulness_score_for(
+        accuracy_score=accuracy_score,
+        structure_score=structure_score,
+        compression_score=compression_score,
+        forbidden_facts_hit=len(forbidden_hits),
+        think_leak=think_leak,
+    )
 
     routing = route_local_artifact(
         artifact=case.artifact,
@@ -415,16 +1078,34 @@ async def evaluate_case(case: EvalCase) -> CaseResult:
         think_leak=think_leak,
     )
     recommendation = routing.routing_decision
+    local_judge_score = None
+    local_judge_notes = "skipped"
+    if use_local_judge:
+        local_judge_score, local_judge_notes = await local_judge_case(
+            case,
+            output,
+            judge_model or server.CODE_MODEL,
+        )
+    expected = case.expected_recommendation
+    decision_matches_expected = (
+        True
+        if not expected
+        else recommendation == expected or (expected == "use_local" and recommendation == "verify_raw")
+    )
 
     return CaseResult(
         name=case.name,
         category=case.category,
         tool=case.tool,
+        model=tool_model(case.tool),
+        source=case.source,
         recommendation=recommendation,
-        expected_recommendation=case.expected_recommendation,
-        decision_matches_expected=recommendation == case.expected_recommendation
-        or (case.expected_recommendation == "use_local" and recommendation == "verify_raw"),
+        expected_recommendation=expected,
+        decision_matches_expected=decision_matches_expected,
         accuracy_score=round(accuracy_score, 3),
+        structure_score=structure_score,
+        compression_score=compression_score,
+        usefulness_score=usefulness_score,
         required_facts_hit=required_hits,
         required_facts_total=len(required),
         optional_facts_hit=optional_hits,
@@ -433,6 +1114,7 @@ async def evaluate_case(case: EvalCase) -> CaseResult:
         forbidden_fact_labels=forbidden_hits,
         missing_required_facts=missing_required,
         missing_optional_facts=missing_optional,
+        structure_violations=structure_violations,
         think_leak=think_leak,
         raw_cloud_tokens_est=raw_tokens,
         assisted_cloud_tokens_est=assisted_tokens,
@@ -445,6 +1127,9 @@ async def evaluate_case(case: EvalCase) -> CaseResult:
         cloud_tokens_avoided_est=routing.cloud_tokens_avoided_est,
         compression_ratio=round(assisted_tokens / raw_tokens, 3) if raw_tokens else 0.0,
         latency_ms=latency_ms,
+        tokens_per_second=tokens_per_second,
+        local_judge_score=local_judge_score,
+        local_judge_notes=local_judge_notes,
         output_preview=one_line(output),
         local_output=output,
     )
@@ -465,6 +1150,9 @@ def render_markdown(results: dict) -> str:
         f"- Raw-cloud recommendations: `{summary['raw_cloud_count']}`",
         f"- Aggregate estimated cloud-token reduction: `{summary['aggregate_token_reduction_pct']:.1%}`",
         f"- Average accuracy score: `{summary['average_accuracy_score']:.1%}`",
+        f"- Average usefulness score: `{summary['average_usefulness_score']:.1%}`",
+        f"- Average structure score: `{summary['average_structure_score']:.1%}`",
+        f"- Average latency: `{summary['average_latency_ms']} ms`",
         f"- Think leakage observed: `{'yes' if summary['think_leak_count'] else 'no'}`",
         f"- Contradiction/format risk flags: `{summary['forbidden_fact_hit_count']}`",
         "",
@@ -482,24 +1170,25 @@ def render_markdown(results: dict) -> str:
         "",
         "## Case Results",
         "",
-        "| Case | Tool | Route | Confidence | Accuracy | Token Reduction | Latency | Missing Required Facts | Risk Flags |",
-        "| --- | --- | --- | ---: | ---: | ---: | ---: | --- | --- |",
+        "| Case | Tool | Route | Useful | Accuracy | Structure | Token Reduction | Latency | Missing Required Facts | Violations |",
+        "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | --- | --- |",
     ]
 
     for case in results["cases"]:
         missing = ", ".join(case["missing_required_facts"]) or "-"
-        risks = ", ".join(case["forbidden_fact_labels"]) or "-"
+        violations = ", ".join(case["structure_violations"] + case["forbidden_fact_labels"]) or "-"
         lines.append(
-            "| {name} | `{tool}` | `{recommendation}` | {confidence:.0%} | {accuracy:.0%} | {reduction:.0%} | {latency} ms | {missing} | {risks} |".format(
+            "| {name} | `{tool}` | `{recommendation}` | {useful:.0%} | {accuracy:.0%} | {structure:.0%} | {reduction:.0%} | {latency} ms | {missing} | {violations} |".format(
                 name=case["name"],
                 tool=case["tool"],
                 recommendation=case["recommendation"],
-                confidence=case["confidence_score"],
+                useful=case["usefulness_score"],
                 accuracy=case["accuracy_score"],
+                structure=case["structure_score"],
                 reduction=case["estimated_cloud_token_reduction_pct"],
                 latency=case["latency_ms"],
                 missing=missing,
-                risks=risks,
+                violations=violations,
             )
         )
 
@@ -510,6 +1199,14 @@ def render_markdown(results: dict) -> str:
                 f"### {case['name']}",
                 "",
                 f"- Recommendation: `{case['recommendation']}`",
+                f"- Source: `{case['source']}`",
+                f"- Model: `{case['model']}`",
+                f"- Accuracy score: `{case['accuracy_score']}`",
+                f"- Structure score: `{case['structure_score']}`",
+                f"- Compression score: `{case['compression_score']}`",
+                f"- Usefulness score: `{case['usefulness_score']}`",
+                f"- Local judge score: `{case['local_judge_score'] if case['local_judge_score'] is not None else 'n/a'}`",
+                f"- Local judge notes: `{case['local_judge_notes']}`",
                 f"- Raw cloud tokens est: `{case['raw_cloud_tokens_est']}`",
                 f"- Assisted cloud tokens est: `{case['assisted_cloud_tokens_est']}`",
                 f"- Artifact tokens est: `{case['artifact_tokens_est']}`",
@@ -532,6 +1229,7 @@ def render_markdown(results: dict) -> str:
             "- `verify_raw` means Qwen helped, but GPT-5.5/Codex should inspect the original artifact before final judgment.",
             "- `skip_local` means the raw input is small enough that local preprocessing is not worth adding to the workflow.",
             "- Risk flags catch contradictions, generic false positives, or verbose outputs that violate the helper contract.",
+            "- `usefulness_score` is deterministic and combines fact coverage, structure, and compression. Local judge scores are optional metadata only.",
             "- Token counts are stable estimates for relative comparison, not billable provider counts.",
             "- Before large branch pushes or review summaries, route local diffs/logs through `local_code_review` or `local_summarize` and send only accepted local summaries to cloud.",
             "",
@@ -543,8 +1241,9 @@ def render_markdown(results: dict) -> str:
 def summarize(case_results: list[CaseResult]) -> dict:
     raw_total = sum(result.raw_cloud_tokens_est for result in case_results)
     assisted_total = sum(result.assisted_cloud_tokens_est for result in case_results)
+    count = len(case_results)
     return {
-        "case_count": len(case_results),
+        "case_count": count,
         "use_local_count": sum(result.recommendation == "use_local" for result in case_results),
         "optional_local_count": sum(result.recommendation == "optional_local" for result in case_results),
         "verify_raw_count": sum(result.recommendation == "verify_raw" for result in case_results),
@@ -553,12 +1252,166 @@ def summarize(case_results: list[CaseResult]) -> dict:
         "think_leak_count": sum(result.think_leak for result in case_results),
         "forbidden_fact_hit_count": sum(result.forbidden_facts_hit for result in case_results),
         "decision_match_count": sum(result.decision_matches_expected for result in case_results),
-        "average_accuracy_score": sum(result.accuracy_score for result in case_results) / len(case_results),
+        "average_latency_ms": round(
+            sum(result.latency_ms for result in case_results) / count
+        )
+        if count
+        else 0,
+        "average_tokens_per_second": round(
+            sum(result.tokens_per_second for result in case_results) / count, 2
+        )
+        if count
+        else 0.0,
+        "average_accuracy_score": sum(result.accuracy_score for result in case_results) / count
+        if count
+        else 0.0,
+        "average_structure_score": sum(result.structure_score for result in case_results) / count
+        if count
+        else 0.0,
+        "average_compression_score": sum(result.compression_score for result in case_results) / count
+        if count
+        else 0.0,
+        "average_usefulness_score": sum(result.usefulness_score for result in case_results) / count
+        if count
+        else 0.0,
         "aggregate_raw_cloud_tokens_est": raw_total,
         "aggregate_assisted_cloud_tokens_est": assisted_total,
         "aggregate_token_reduction": raw_total - assisted_total,
         "aggregate_token_reduction_pct": (raw_total - assisted_total) / raw_total if raw_total else 0.0,
     }
+
+
+def read_run_index(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    rows: list[dict] = []
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(row, dict):
+                rows.append(row)
+    return rows
+
+
+def clean_run_row(row: dict) -> dict:
+    return {
+        "timestamp": row.get("timestamp"),
+        "suite": row.get("suite"),
+        "case_count": row.get("case_count"),
+        "use_local_count": row.get("use_local_count"),
+        "verify_raw_count": row.get("verify_raw_count"),
+        "skip_local_count": row.get("skip_local_count"),
+        "raw_cloud_count": row.get("raw_cloud_count"),
+        "average_accuracy_score": row.get("average_accuracy_score"),
+        "average_structure_score": row.get("average_structure_score"),
+        "average_usefulness_score": row.get("average_usefulness_score"),
+        "average_latency_ms": row.get("average_latency_ms"),
+        "think_leak_count": row.get("think_leak_count"),
+        "aggregate_token_reduction_pct": row.get("aggregate_token_reduction_pct"),
+    }
+
+
+def number_value(value: object) -> float | None:
+    if isinstance(value, (int, float)):
+        return float(value)
+    return None
+
+
+def sum_metric(rows: list[dict], key: str) -> int:
+    return int(sum(number_value(row.get(key)) or 0 for row in rows))
+
+
+def average_metric(rows: list[dict], key: str) -> float | None:
+    values = [number_value(row.get(key)) for row in rows]
+    values = [value for value in values if value is not None]
+    if not values:
+        return None
+    return sum(values) / len(values)
+
+
+def latest_row(rows: list[dict]) -> dict:
+    sortable = [row for row in rows if row.get("timestamp")]
+    return max(sortable, key=lambda row: str(row.get("timestamp"))) if sortable else (rows[-1] if rows else {})
+
+
+def format_pct(value: float | None) -> str:
+    return "n/a" if value is None else f"{value:.1%}"
+
+
+def format_latency(value: float | None) -> str:
+    return "n/a" if value is None else f"{value:.0f} ms"
+
+
+def format_dashboard_row(suite: str, group: list[dict]) -> str:
+    latest = latest_row(group)
+    report_path = str(latest.get("markdown_path") or "")
+    report_cell = f"[report]({report_path})" if report_path else "-"
+    return (
+        "| {suite} | {latest} | {runs} | {cases} | {accuracy} | {structure} | "
+        "{usefulness} | {latency} | {use_local} | {raw_cloud} | {think_leaks} | {report} |"
+    ).format(
+        suite=suite,
+        latest=latest.get("timestamp", "n/a"),
+        runs=len(group),
+        cases=sum_metric(group, "case_count"),
+        accuracy=format_pct(average_metric(group, "average_accuracy_score")),
+        structure=format_pct(average_metric(group, "average_structure_score")),
+        usefulness=format_pct(average_metric(group, "average_usefulness_score")),
+        latency=format_latency(average_metric(group, "average_latency_ms")),
+        use_local=sum_metric(group, "use_local_count"),
+        raw_cloud=sum_metric(group, "raw_cloud_count"),
+        think_leaks=sum_metric(group, "think_leak_count"),
+        report=report_cell,
+    )
+
+
+def render_eval_dashboard(rows: list[dict]) -> str:
+    rows = [row for row in rows if row.get("suite")]
+    latest = latest_row(rows)
+    lines = [
+        "# Local Ollama MCP Evaluation Dashboard",
+        "",
+        f"- Runs tracked: `{len(rows)}`",
+        f"- Latest run: `{latest.get('timestamp', 'n/a')}`",
+        "",
+        "| Suite | Latest Run | Runs | Cases | Avg Accuracy | Avg Structure | Avg Usefulness | Avg Latency | Use Local | Raw Cloud | Think Leaks | Latest Local Report |",
+        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
+    ]
+    for suite in sorted({str(row.get("suite")) for row in rows}):
+        group = [row for row in rows if row.get("suite") == suite]
+        lines.append(format_dashboard_row(suite, group))
+    lines.extend(
+        [
+            "",
+            "Local report links point at this machine's generated reports and are intentionally not included in clean exports.",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def write_eval_dashboard(index_path: Path, dashboard_path: Path) -> None:
+    dashboard_path.write_text(render_eval_dashboard(read_run_index(index_path)), encoding="utf-8")
+
+
+def export_clean_runs(index_path: Path, clean_dir: Path) -> list[Path]:
+    rows = [clean_run_row(row) for row in read_run_index(index_path) if row.get("suite")]
+    clean_dir.mkdir(parents=True, exist_ok=True)
+    json_path = clean_dir / "eval_runs_clean.json"
+    jsonl_path = clean_dir / "eval_runs_clean.jsonl"
+    dashboard_path = clean_dir / "eval_dashboard_clean.md"
+    json_path.write_text(json.dumps(rows, indent=2, sort_keys=True), encoding="utf-8")
+    with jsonl_path.open("w", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(json.dumps(row, sort_keys=True, ensure_ascii=False, default=str) + "\n")
+    dashboard_path.write_text(render_eval_dashboard(rows), encoding="utf-8")
+    return [json_path, jsonl_path, dashboard_path]
 
 
 def latest_outcomes_by_task(records: list[dict]) -> dict[str, dict]:
@@ -922,13 +1775,21 @@ async def run_eval(args: argparse.Namespace) -> dict:
         warm_result = "skipped"
 
     case_results = []
-    for case in build_cases():
-        case_results.append(await evaluate_case(case))
+    for case in build_suite_cases(args):
+        case_results.append(
+            await evaluate_case(
+                case,
+                use_local_judge=args.local_judge,
+                judge_model=args.judge_model,
+            )
+        )
 
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "model": server.CODE_MODEL,
+        "reason_model": server.REASON_MODEL,
         "num_ctx": server.DEFAULT_NUM_CTX,
+        "suite": args.suite,
         "method": "local output scored against expert baseline facts; token counts are regex estimates",
         "status_before": status_before,
         "warm_result": warm_result,
@@ -939,8 +1800,13 @@ async def run_eval(args: argparse.Namespace) -> dict:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Evaluate qwen2.5-coder local MCP usefulness for reducing cloud context."
+        description="Evaluate local MCP usefulness for reducing cloud context."
     )
+    parser.add_argument("--suite", choices=SUITES, default="synthetic", help="Offline eval suite to run.")
+    parser.add_argument("--model", default="", help="Override default local Ollama model to evaluate.")
+    parser.add_argument("--plan-model", default="", help="Override the local planning model for this run.")
+    parser.add_argument("--reason-model", default="", help="Override the local reasoning model for this run.")
+    parser.add_argument("--warm-model", default="", help="Override the local warm model for this run.")
     parser.add_argument("--output-dir", default=".", help="Directory for JSON and Markdown reports.")
     parser.add_argument("--json-name", default="local_mcp_eval_results.json")
     parser.add_argument("--markdown-name", default="local_mcp_eval_report.md")
@@ -950,11 +1816,79 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ledger-path", default="", help="Ledger path for --from-ledger; defaults to LOCAL_MCP_LEDGER_PATH or .local_ollama_mcp/ledger.jsonl.")
     parser.add_argument("--routing-check", action="store_true", help="Run deterministic local routing checks without invoking Ollama.")
     parser.add_argument("--log-file", default="", help="Optional recent command/log file to include in --routing-check.")
+    parser.add_argument("--case-file", action="append", default=[], help="External JSONL eval case file.")
+    parser.add_argument("--case-dir", default=DEFAULT_CASE_DIR, help="Directory of external JSONL eval cases.")
+    parser.add_argument("--artifact-dir", default=DEFAULT_ARTIFACT_DIR, help="Directory with diffs/ and logs/ artifacts.")
+    parser.add_argument("--local-judge", action="store_true", help="Add optional non-authoritative local model judge scores.")
+    parser.add_argument("--judge-model", default=server.CODE_MODEL, help="Local Ollama model for --local-judge.")
+    parser.add_argument("--run-index-path", default=DEFAULT_RUN_INDEX, help="Append one summary row per run.")
+    parser.add_argument("--write-dashboard", action="store_true", help="Write the aggregate eval dashboard from the run index without running cases.")
+    parser.add_argument("--dashboard-path", default=DEFAULT_DASHBOARD_PATH, help="Dashboard path for --write-dashboard.")
+    parser.add_argument("--export-clean", default="", metavar="CLEAN_DIR", help="Write anonymous aggregate eval exports into CLEAN_DIR without raw outputs or local paths.")
     return parser.parse_args()
+
+
+def current_git_commit() -> str:
+    ok, output = run_git_command(["rev-parse", "--short", "HEAD"])
+    return output.strip() if ok else "unknown"
+
+
+def append_run_index(results: dict, json_path: Path, markdown_path: Path, index_path: Path) -> None:
+    if results.get("method", "").startswith("captured ledger"):
+        suite = "ledger"
+    elif results.get("method", "").startswith("deterministic local routing"):
+        suite = "routing"
+    else:
+        suite = results.get("suite", "synthetic")
+    summary = results.get("summary", {})
+    row = {
+        "timestamp": results.get("generated_at"),
+        "git_commit": current_git_commit(),
+        "suite": suite,
+        "model": results.get("model"),
+        "reason_model": results.get("reason_model"),
+        "num_ctx": results.get("num_ctx"),
+        "case_count": summary.get("case_count") or summary.get("tool_record_count") or 0,
+        "use_local_count": summary.get("use_local_count"),
+        "verify_raw_count": summary.get("verify_raw_count"),
+        "skip_local_count": summary.get("skip_local_count"),
+        "raw_cloud_count": summary.get("raw_cloud_count"),
+        "average_accuracy_score": summary.get("average_accuracy_score"),
+        "average_structure_score": summary.get("average_structure_score"),
+        "average_usefulness_score": summary.get("average_usefulness_score"),
+        "average_latency_ms": summary.get("average_latency_ms"),
+        "average_tokens_per_second": summary.get("average_tokens_per_second", 0.0),
+        "think_leak_count": summary.get("think_leak_count"),
+        "aggregate_token_reduction_pct": summary.get("aggregate_token_reduction_pct")
+        or summary.get("aggregate_context_reduction_pct"),
+        "json_path": str(json_path),
+        "markdown_path": str(markdown_path),
+    }
+    index_path.parent.mkdir(parents=True, exist_ok=True)
+    with index_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(row, sort_keys=True, ensure_ascii=False, default=str) + "\n")
 
 
 async def main() -> None:
     args = parse_args()
+    server.configure_models(
+        code_model=args.model or None,
+        plan_model=args.plan_model or None,
+        reason_model=args.reason_model or None,
+        warm_model=args.warm_model or None,
+    )
+    run_index_path = Path(args.run_index_path)
+    if args.write_dashboard:
+        dashboard_path = Path(args.dashboard_path)
+        write_eval_dashboard(run_index_path, dashboard_path)
+        print(f"Wrote {dashboard_path}")
+        return
+    if args.export_clean:
+        written = export_clean_runs(run_index_path, Path(args.export_clean))
+        for path in written:
+            print(f"Wrote {path}")
+        return
+
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -969,6 +1903,7 @@ async def main() -> None:
     else:
         markdown = render_markdown(results)
     markdown_path.write_text(markdown, encoding="utf-8")
+    append_run_index(results, json_path, markdown_path, run_index_path)
 
     summary = results["summary"]
     if args.from_ledger:
@@ -1019,6 +1954,8 @@ async def main() -> None:
             raw_cloud: {summary['raw_cloud_count']}
             aggregate token reduction: {summary['aggregate_token_reduction_pct']:.1%}
             average accuracy: {summary['average_accuracy_score']:.1%}
+            average usefulness: {summary['average_usefulness_score']:.1%}
+            average latency: {summary['average_latency_ms']} ms
             think leakage: {'yes' if summary['think_leak_count'] else 'no'}
             """
         ).strip()

@@ -13,11 +13,14 @@ import argparse
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 import glob
+import gzip
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
+import shutil
+import sqlite3
 import sys
 import time
 from typing import Any, TextIO
@@ -27,6 +30,9 @@ DEFAULT_TELEMETRY_DIR = ".local_ollama_mcp/codex_telemetry"
 DEFAULT_SESSIONS_GLOB = "~/.codex/sessions/**/*.jsonl"
 DEFAULT_LOCAL_MCP_LEDGER = ".local_ollama_mcp/ledger.jsonl"
 DEFAULT_TUI_LOG = "~/.codex/log/codex-tui.log"
+DEFAULT_TELEMETRY_ROTATE_BYTES = 25_000_000
+DEFAULT_TELEMETRY_RETENTION_DAYS = 90
+TELEMETRY_LEDGER_FILES = ("events.jsonl", "turns.jsonl", "sources.jsonl")
 TOKEN_RE = re.compile(r"\w+|[^\w\s]", re.UNICODE)
 UUID_RE = re.compile(
     r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
@@ -36,6 +42,30 @@ TUI_THREAD_RE = re.compile(r"session_loop\{thread_id=([^}]+)\}")
 TUI_TURN_RE = re.compile(r"turn\.id=([^\s}]+)")
 TUI_MODEL_RE = re.compile(r"\bmodel=([^\s}]+)")
 TUI_EFFORT_RE = re.compile(r"codex\.turn\.reasoning_effort=([^\s}]+)")
+AGY_FALLBACK_PREFIXES = (
+    "[agy_rate_limited]",
+    "[agy_timeout]",
+    "[agy_missing_binary]",
+    "[agy_error]",
+    "[agy_circuit_open]",
+)
+POST_TURN_ADVISORY_MIN_TOKENS = int(os.getenv("CODEX_TELEMETRY_ADVISORY_MIN_TOKENS", "4000"))
+ADVISORY_DIFF_RE = re.compile(r"(?m)^(diff --git|@@ |\+\+\+ |--- |\+[^+]|-[^-])")
+ADVISORY_LOG_RE = re.compile(r"(?i)(traceback|exception|error|failed|failure|timeout|segfault|panic|stack trace)")
+ADVISORY_REPO_MAP_RE = re.compile(
+    r"(?m)^([./\w-]+/|[./\w-]+\.(py|js|ts|tsx|go|rs|md|toml|json|ya?ml|txt))$"
+)
+ADVISORY_CONFIG_RE = re.compile(r"(?im)^([A-Z][A-Z0-9_]{2,}=|[\w.-]+\.(toml|json|ya?ml|ini|env)|\s*[-\w]+\s*:)")
+ADVISORY_PR_RE = re.compile(r"(?i)(pull request|reviewer|requested changes|unresolved|approve|merge blocker|ci failed)")
+ANSI_RESET = "\033[0m"
+ANSI_MUTED = "\033[2m"
+ANSI_BOLD = "\033[1m"
+ANSI_CYAN = "\033[36m"
+ANSI_GREEN = "\033[32m"
+ANSI_YELLOW = "\033[33m"
+ANSI_RED = "\033[31m"
+ANSI_BLUE = "\033[34m"
+ANSI_MAGENTA = "\033[35m"
 
 
 def capture_enabled(env: dict[str, str] | None = None) -> bool:
@@ -46,6 +76,16 @@ def capture_enabled(env: dict[str, str] | None = None) -> bool:
 def echo_enabled(env: dict[str, str] | None = None) -> bool:
     env = env or os.environ
     return env.get("CODEX_TELEMETRY_ECHO") == "1"
+
+
+def color_echo_enabled(stdout: TextIO, env: dict[str, str] | None = None) -> bool:
+    env = os.environ if env is None else env
+    override = env.get("CODEX_TELEMETRY_COLOR")
+    if override == "1":
+        return True
+    if override == "0" or "NO_COLOR" in env:
+        return False
+    return bool(getattr(stdout, "isatty", lambda: False)())
 
 
 def redact_enabled(env: dict[str, str] | None = None) -> bool:
@@ -66,6 +106,28 @@ def default_sessions_glob(env: dict[str, str] | None = None) -> str:
 def default_tui_log(env: dict[str, str] | None = None) -> Path:
     env = env or os.environ
     return Path(os.path.expanduser(env.get("CODEX_TELEMETRY_TUI_LOG", DEFAULT_TUI_LOG)))
+
+
+def env_int(env: dict[str, str], name: str, default: int) -> int:
+    try:
+        return int(env.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def default_rotate_bytes(env: dict[str, str] | None = None) -> int:
+    env = env or os.environ
+    return max(0, env_int(env, "CODEX_TELEMETRY_ROTATE_BYTES", DEFAULT_TELEMETRY_ROTATE_BYTES))
+
+
+def default_retention_days(env: dict[str, str] | None = None) -> int:
+    env = env or os.environ
+    return max(0, env_int(env, "CODEX_TELEMETRY_RETENTION_DAYS", DEFAULT_TELEMETRY_RETENTION_DAYS))
+
+
+def default_rotation_enabled(env: dict[str, str] | None = None) -> bool:
+    env = env or os.environ
+    return env.get("CODEX_TELEMETRY_ROTATION", "1") != "0"
 
 
 def estimate_tokens(text: str) -> int:
@@ -154,7 +216,7 @@ def tool_name_from_payload(payload: dict[str, Any]) -> str:
 def source_kind_for_tool(tool_name: str) -> str:
     if tool_name in {"shell", "exec_command", "apply_patch"}:
         return "shell_output"
-    if tool_name.startswith("local_"):
+    if tool_name.startswith(("local_", "agy_", "gemini_")):
         return "local_mcp_output"
     return "unknown"
 
@@ -162,6 +224,48 @@ def source_kind_for_tool(tool_name: str) -> str:
 def source_ref(tool_name: str, call_id: str, arguments: Any) -> str:
     _ = arguments
     return f"{tool_name}:{call_id}"
+
+
+def infer_advisory_category(tool_name: str, output_text: str) -> str:
+    if tool_name in {"shell", "exec_command"} and ADVISORY_LOG_RE.search(output_text):
+        return "logs"
+    if ADVISORY_DIFF_RE.search(output_text):
+        return "diff"
+    if ADVISORY_LOG_RE.search(output_text):
+        return "logs"
+    if ADVISORY_PR_RE.search(output_text):
+        return "pr_thread"
+    if ADVISORY_CONFIG_RE.search(output_text):
+        return "config"
+    lines = [line.strip() for line in output_text.splitlines() if line.strip()]
+    path_like = sum(1 for line in lines if ADVISORY_REPO_MAP_RE.search(line))
+    if lines and path_like / max(1, len(lines)) >= 0.50:
+        return "repo_map"
+    return "mixed_context"
+
+
+def suggested_gemini_reducer(category: str) -> str:
+    return {
+        "diff": "gemini_compress_diff",
+        "logs": "gemini_debug_digest",
+        "repo_map": "gemini_repo_map_digest",
+        "config": "gemini_config_surface_digest",
+        "pr_thread": "gemini_pr_thread_digest",
+        "mixed_context": "gemini_context_pack",
+    }.get(category, "gemini_context_pack")
+
+
+def post_turn_advisory(tool_name: str, output_text: str, token_estimate: int) -> dict[str, Any] | None:
+    if token_estimate < POST_TURN_ADVISORY_MIN_TOKENS:
+        return None
+    category = infer_advisory_category(tool_name, output_text)
+    return {
+        "post_turn_advisory": "should_compress_next_time",
+        "advisory_category": category,
+        "advisory_raw_tokens_est": token_estimate,
+        "advisory_route_decision": "gemini_recommended",
+        "advisory_reducer": suggested_gemini_reducer(category),
+    }
 
 
 def rate_reset_at(observed: str, seconds: Any) -> str | None:
@@ -204,7 +308,7 @@ def normalize_quota(payload: Any) -> tuple[float | None, str]:
     if isinstance(payload, list):
         values = [normalize_quota(item)[0] for item in payload]
         values = [value for value in values if value is not None]
-        return (max(values), "balance_array") if values else (None, "missing")
+        return (max(values), "quota_array") if values else (None, "missing")
     if not isinstance(payload, dict):
         return None, "missing"
 
@@ -242,6 +346,80 @@ def normalize_quota(payload: Any) -> tuple[float | None, str]:
     return None, "missing"
 
 
+def requested_provider_for_record(record: dict[str, Any]) -> str:
+    provider = record.get("requested_provider")
+    if isinstance(provider, str) and provider:
+        return provider
+    model = record.get("model")
+    if not isinstance(model, str) or not model:
+        return "unknown"
+    if model.startswith("antigravity/"):
+        return "agy"
+    return "local"
+
+
+def actual_provider_for_record(record: dict[str, Any]) -> str:
+    requested_provider = requested_provider_for_record(record)
+    output = stable_text(record.get("local_output", "")).lstrip()
+    if requested_provider == "agy" and output.startswith(AGY_FALLBACK_PREFIXES):
+        return "local"
+    return requested_provider
+
+
+def int_field(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def saved_tokens_for_record(record: dict[str, Any]) -> int:
+    token_estimates = record.get("token_estimates") or {}
+    model = record.get("model")
+    model_text = model.lower() if isinstance(model, str) else ""
+    if model_text.startswith("antigravity/") and "gemini" in model_text:
+        for value in (
+            record.get("gemini_saved_tokens_est"),
+            token_estimates.get("gemini_saved"),
+        ):
+            if value is not None:
+                return max(0, int_field(value))
+    return int_field(token_estimates.get("context_reduction"))
+
+
+def mcp_saved_breakdown(sources: list[dict[str, Any]]) -> dict[str, int]:
+    local_saved = 0
+    agy_saved = 0
+    for source in sources:
+        saved = int(source.get("raw_context_avoided") or 0)
+        provider = source.get("mcp_provider")
+        if provider == "agy":
+            agy_saved += saved
+        elif provider in {"local", None, ""}:
+            local_saved += saved
+    return {
+        "local": local_saved,
+        "agy": agy_saved,
+        "total": local_saved + agy_saved,
+    }
+
+
+def mcp_source_count_breakdown(sources: list[dict[str, Any]]) -> dict[str, int]:
+    local_count = 0
+    agy_count = 0
+    for source in sources:
+        provider = source.get("mcp_provider")
+        if provider == "agy":
+            agy_count += 1
+        elif provider in {"local", None, ""}:
+            local_count += 1
+    return {
+        "local": local_count,
+        "agy": agy_count,
+        "total": local_count + agy_count,
+    }
+
+
 def cache_pressure_level(turn_input_tokens: int, turn_cached_input_tokens: int) -> str:
     if turn_input_tokens <= 0 or turn_cached_input_tokens <= 0:
         return "none"
@@ -275,8 +453,16 @@ class PendingSource:
     timestamp: str
     event_seq: int
     raw_context_avoided: int = 0
+    mcp_provider: str = "unknown"
+    requested_provider: str = "unknown"
+    model: str | None = None
     confidence: str = "unknown"
     task_id: str | None = None
+    post_turn_advisory: str | None = None
+    advisory_category: str | None = None
+    advisory_raw_tokens_est: int = 0
+    advisory_route_decision: str | None = None
+    advisory_reducer: str | None = None
 
 
 @dataclass
@@ -291,9 +477,49 @@ class ProcessResult:
         self.sources.extend(other.sources)
 
 
-class JsonlLedger:
-    def __init__(self, telemetry_dir: Path):
+class TelemetryStorage:
+    def __init__(
+        self,
+        telemetry_dir: Path,
+        *,
+        rotate_bytes: int = DEFAULT_TELEMETRY_ROTATE_BYTES,
+        retention_days: int = DEFAULT_TELEMETRY_RETENTION_DAYS,
+        rotation_enabled: bool = True,
+    ):
         self.telemetry_dir = telemetry_dir
+        self.rotate_bytes = max(0, rotate_bytes)
+        self.retention_days = max(0, retention_days)
+        self.rotation_enabled = rotation_enabled
+        self.state_path = self.telemetry_dir / "state.sqlite3"
+        self._connection: sqlite3.Connection | None = None
+
+    def _connect(self) -> sqlite3.Connection:
+        if self._connection is None:
+            self.telemetry_dir.mkdir(parents=True, exist_ok=True)
+            self._connection = sqlite3.connect(self.state_path)
+            self._connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS turn_keys (
+                    session_file TEXT NOT NULL,
+                    thread_id TEXT NOT NULL,
+                    turn_id TEXT NOT NULL,
+                    usage_signature TEXT NOT NULL,
+                    first_seen_at TEXT NOT NULL,
+                    PRIMARY KEY (session_file, thread_id, turn_id, usage_signature)
+                )
+                """
+            )
+            self._connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS rotations (
+                    rotation_id TEXT PRIMARY KEY,
+                    rotated_at TEXT NOT NULL,
+                    trigger_name TEXT NOT NULL
+                )
+                """
+            )
+            self._connection.commit()
+        return self._connection
 
     def append(self, name: str, rows: list[dict[str, Any]]) -> None:
         if not rows:
@@ -317,23 +543,75 @@ class JsonlLedger:
                     if self._source_turn_key(source) in accepted_turn_keys
                 ],
             )
+        self.rotate_if_needed()
+        self.cleanup_archives()
 
-    def _existing_turn_keys(self) -> set[tuple[str, str, str, str]]:
-        path = self.telemetry_dir / "turns.jsonl"
+    def compact_now(self) -> None:
+        self.rotate_if_needed()
+        self.cleanup_archives()
+
+    def rotate_if_needed(self) -> bool:
+        if not self.rotation_enabled or self.rotate_bytes <= 0:
+            return False
+        for name in TELEMETRY_LEDGER_FILES:
+            path = self.telemetry_dir / name
+            if path.exists() and path.stat().st_size >= self.rotate_bytes:
+                self._rotate_active_ledgers(name)
+                return True
+        return False
+
+    def cleanup_archives(self) -> None:
+        if self.retention_days <= 0:
+            return
+        archive_root = self.telemetry_dir / "archive"
+        if not archive_root.exists():
+            return
+        cutoff = time.time() - (self.retention_days * 24 * 60 * 60)
+        for path in archive_root.glob("*/*.jsonl.gz"):
+            try:
+                if path.stat().st_mtime < cutoff:
+                    path.unlink()
+            except FileNotFoundError:
+                continue
+
+    def _rotate_active_ledgers(self, trigger_name: str) -> None:
+        rotation_dt = datetime.now(timezone.utc)
+        rotation_id = rotation_dt.strftime("%Y-%m-%dT%H-%M-%S.%fZ")
+        archive_dir = self.telemetry_dir / "archive" / rotation_dt.strftime("%Y-%m-%d")
+        archive_dir.mkdir(parents=True, exist_ok=True)
+
+        rotated_any = False
+        for name in TELEMETRY_LEDGER_FILES:
+            active_path = self.telemetry_dir / name
+            if not active_path.exists() or active_path.stat().st_size == 0:
+                active_path.parent.mkdir(parents=True, exist_ok=True)
+                active_path.touch(exist_ok=True)
+                continue
+            archive_path = self._unique_archive_path(archive_dir / f"{rotation_id}.{name}.gz")
+            with active_path.open("rb") as source, gzip.open(archive_path, "wb") as target:
+                shutil.copyfileobj(source, target)
+            active_path.write_text("", encoding="utf-8")
+            rotated_any = True
+
+        if rotated_any:
+            conn = self._connect()
+            conn.execute(
+                "INSERT OR IGNORE INTO rotations (rotation_id, rotated_at, trigger_name) VALUES (?, ?, ?)",
+                (rotation_id, rotation_dt.isoformat(), trigger_name),
+            )
+            conn.commit()
+
+    @staticmethod
+    def _unique_archive_path(path: Path) -> Path:
         if not path.exists():
-            return set()
-        keys: set[tuple[str, str, str, str]] = set()
-        with path.open("r", encoding="utf-8") as handle:
-            for line in handle:
-                try:
-                    row = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(row, dict):
-                    key = self._turn_key(row)
-                    if key:
-                        keys.add(key)
-        return keys
+            return path
+        stem = path.name
+        counter = 1
+        while True:
+            candidate = path.with_name(f"{stem}.{counter}")
+            if not candidate.exists():
+                return candidate
+            counter += 1
 
     @staticmethod
     def _turn_key(row: dict[str, Any]) -> tuple[str, str, str, str] | None:
@@ -362,41 +640,80 @@ class JsonlLedger:
     def _dedupe_turns(
         self, rows: list[dict[str, Any]]
     ) -> tuple[list[dict[str, Any]], set[tuple[str, str, str, str]]]:
-        existing = self._existing_turn_keys()
         accepted: set[tuple[str, str, str, str]] = set()
         output: list[dict[str, Any]] = []
+        conn = self._connect()
         for row in rows:
             key = self._turn_key(row)
             if key is None:
                 output.append(row)
                 continue
-            if key in existing or key in accepted:
+            if key in accepted:
                 continue
-            accepted.add(key)
-            output.append(row)
+            cursor = conn.execute(
+                """
+                INSERT OR IGNORE INTO turn_keys (
+                    session_file,
+                    thread_id,
+                    turn_id,
+                    usage_signature,
+                    first_seen_at
+                )
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (*key, utc_now()),
+            )
+            if cursor.rowcount:
+                accepted.add(key)
+                output.append(row)
+        conn.commit()
         return output, accepted
+
+
+JsonlLedger = TelemetryStorage
 
 
 class LocalLedgerIndex:
     def __init__(self, path: Path):
-        self.records = self._read(path)
+        self.path = path
+        self.records: list[dict[str, Any]] = []
+        self._last_fingerprint: tuple[int, int] | None = None
+        self.refresh_if_changed()
+
+    def _fingerprint(self) -> tuple[int, int] | None:
+        try:
+            stat = self.path.stat()
+        except OSError:
+            return None
+        return (stat.st_mtime_ns, stat.st_size)
+
+    def refresh_if_changed(self) -> bool:
+        fingerprint = self._fingerprint()
+        if fingerprint == self._last_fingerprint:
+            return False
+        self._last_fingerprint = fingerprint
+        self.records = self._read(self.path) if fingerprint is not None else []
+        return True
 
     @staticmethod
     def _read(path: Path) -> list[dict[str, Any]]:
         if not path.exists():
             return []
         records: list[dict[str, Any]] = []
-        with path.open("r", encoding="utf-8") as handle:
-            for line in handle:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    value = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(value, dict):
-                    records.append(value)
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        value = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(value, dict):
+                        records.append(value)
+        except OSError:
+            return []
         return records
 
     def match(self, source: PendingSource) -> PendingSource:
@@ -429,9 +746,10 @@ class LocalLedgerIndex:
 
     @staticmethod
     def _apply_record(source: PendingSource, record: dict[str, Any], confidence: str) -> PendingSource:
-        token_estimates = record.get("token_estimates") or {}
-        raw_context_avoided = int(token_estimates.get("context_reduction") or 0)
-        source.raw_context_avoided = raw_context_avoided
+        source.raw_context_avoided = saved_tokens_for_record(record)
+        source.model = str(record["model"]) if record.get("model") is not None else None
+        source.requested_provider = requested_provider_for_record(record)
+        source.mcp_provider = actual_provider_for_record(record)
         source.confidence = confidence
         if record.get("task_id"):
             source.task_id = str(record["task_id"])
@@ -536,15 +854,22 @@ class SessionProcessor:
         tool_name = call.tool_name if call else "unknown"
         arguments = call.arguments if call else {}
         output_text = extract_output_text(payload.get("output", ""))
+        token_estimate = estimate_tokens(output_text)
+        advisory = post_turn_advisory(tool_name, output_text, token_estimate) or {}
         pending = PendingSource(
             source_kind=source_kind_for_tool(tool_name),
             source_ref=source_ref(tool_name, call_id, arguments),
-            token_estimate=estimate_tokens(output_text),
+            token_estimate=token_estimate,
             output_hash=text_hash(output_text),
             call_id=call_id,
             tool_name=tool_name,
             timestamp=timestamp,
             event_seq=event_seq,
+            post_turn_advisory=advisory.get("post_turn_advisory"),
+            advisory_category=advisory.get("advisory_category"),
+            advisory_raw_tokens_est=int(advisory.get("advisory_raw_tokens_est") or 0),
+            advisory_route_decision=advisory.get("advisory_route_decision"),
+            advisory_reducer=advisory.get("advisory_reducer"),
         )
         self.pending_sources.append(self.local_ledger.match(pending))
 
@@ -584,6 +909,12 @@ class SessionProcessor:
         cache_warnings = []
         if pressure_level == "high":
             cache_warnings.append("high_cached_input_turn")
+        mcp_local_saved = sum(
+            source.raw_context_avoided for source in self.pending_sources if source.mcp_provider == "local"
+        )
+        mcp_agy_saved = sum(source.raw_context_avoided for source in self.pending_sources if source.mcp_provider == "agy")
+        mcp_local_count = sum(1 for source in self.pending_sources if source.mcp_provider == "local")
+        mcp_agy_count = sum(1 for source in self.pending_sources if source.mcp_provider == "agy")
 
         return {
             "record_type": "turn",
@@ -620,6 +951,12 @@ class SessionProcessor:
             "cache_ratio_turn": cache_ratio,
             "cache_pressure_level": pressure_level,
             "cache_warnings": cache_warnings,
+            "mcp_local_saved_tokens_est": mcp_local_saved,
+            "mcp_agy_saved_tokens_est": mcp_agy_saved,
+            "mcp_total_saved_tokens_est": mcp_local_saved + mcp_agy_saved,
+            "mcp_local_source_count": mcp_local_count,
+            "mcp_agy_source_count": mcp_agy_count,
+            "mcp_total_source_count": mcp_local_count + mcp_agy_count,
             "primary_rate_used_pct": primary_used,
             "primary_rate_source": primary_source,
             "primary_rate_payload_hash": value_hash(primary),
@@ -653,10 +990,19 @@ class SessionProcessor:
                     "source_ref": source.source_ref,
                     "call_id": source.call_id,
                     "task_id": source.task_id,
+                    "tool_name": source.tool_name,
+                    "mcp_provider": source.mcp_provider,
+                    "requested_provider": source.requested_provider,
+                    "model": source.model,
                     "token_estimate": source.token_estimate,
                     "raw_context_avoided": source.raw_context_avoided,
                     "confidence": source.confidence,
                     "source_hash": source.output_hash,
+                    "post_turn_advisory": source.post_turn_advisory,
+                    "advisory_category": source.advisory_category,
+                    "advisory_raw_tokens_est": source.advisory_raw_tokens_est,
+                    "advisory_route_decision": source.advisory_route_decision,
+                    "advisory_reducer": source.advisory_reducer,
                 }
             )
         return rows
@@ -755,29 +1101,81 @@ def format_count(value: Any) -> str:
     return str(int(value))
 
 
-def format_echo_line(turn: dict[str, Any], sources: list[dict[str, Any]]) -> str:
-    local_saved = sum(int(source.get("raw_context_avoided") or 0) for source in sources)
+def format_pct(value: Any) -> str:
+    if not isinstance(value, (int, float)):
+        return "n/a"
+    return f"{value:.0f}%"
+
+
+def ansi(text: str, color: str, enabled: bool) -> str:
+    if not enabled:
+        return text
+    return f"{color}{text}{ANSI_RESET}"
+
+
+def quota_color(value: Any) -> str:
+    if not isinstance(value, (int, float)):
+        return ANSI_MUTED
+    if value >= 90:
+        return ANSI_RED
+    if value >= 70:
+        return ANSI_YELLOW
+    return ANSI_GREEN
+
+
+def echo_saved_breakdown(turn: dict[str, Any], sources: list[dict[str, Any]]) -> dict[str, int]:
+    saved = mcp_saved_breakdown(sources)
+    if sources:
+        return saved
+    return {
+        "local": int(turn.get("mcp_local_saved_tokens_est") or 0),
+        "agy": int(turn.get("mcp_agy_saved_tokens_est") or 0),
+        "total": int(turn.get("mcp_total_saved_tokens_est") or 0),
+    }
+
+
+def styled_value(text: str, style: str, color: bool) -> str:
+    return ansi(text, ANSI_MUTED if text == "n/a" else style, color)
+
+
+def format_echo_line(turn: dict[str, Any], sources: list[dict[str, Any]], *, color: bool = False) -> str:
+    saved = echo_saved_breakdown(turn, sources)
     ctx = turn.get("context_used_pct")
-    ctx_text = f"{ctx:.0f}%" if isinstance(ctx, (int, float)) else "n/a"
     primary = turn.get("primary_rate_used_pct")
     secondary = turn.get("secondary_rate_used_pct")
-    primary_text = f"{primary:.0f}%" if isinstance(primary, (int, float)) else "n/a"
-    secondary_text = f"{secondary:.0f}%" if isinstance(secondary, (int, float)) else "n/a"
+    cache_pressure = turn.get("cache_pressure_level")
+    if not isinstance(cache_pressure, str):
+        cache_pressure = cache_pressure_level(
+            int(turn.get("turn_input_tokens") or 0),
+            int(turn.get("turn_cached_input_tokens") or 0),
+        )
+    cache_style = ANSI_YELLOW if cache_pressure == "high" else ANSI_CYAN
+    cached_count = format_count(turn.get("turn_cached_input_tokens"))
     return (
-        "codex-telemetry: tokens: "
-        f"in {format_count(turn.get('turn_input_tokens'))} "
-        f"(+{format_count(turn.get('turn_cached_input_tokens'))} cached), "
-        f"out {format_count(turn.get('turn_output_tokens'))}, "
-        f"reason {format_count(turn.get('turn_reasoning_output_tokens'))} | "
-        f"ctx {ctx_text} of {format_count(turn.get('context_window'))} | "
-        f"5h {primary_text}, weekly {secondary_text} | "
-        f"local saved est {format_count(local_saved)}"
+        f"{ansi('codex', ANSI_MUTED, color)}  "
+        f"in {styled_value(format_count(turn.get('turn_input_tokens')), '', color)} "
+        f"(+{styled_value(cached_count, cache_style, color)} cached)  "
+        f"out {styled_value(format_count(turn.get('turn_output_tokens')), '', color)}  "
+        f"reason {styled_value(format_count(turn.get('turn_reasoning_output_tokens')), '', color)}  "
+        f"ctx {styled_value(format_pct(ctx), '', color)}  "
+        f"5h {ansi(format_pct(primary), quota_color(primary), color)}  "
+        f"weekly {ansi(format_pct(secondary), quota_color(secondary), color)}  "
+        f"saved local {styled_value(format_count(saved['local']), ANSI_BLUE, color)}  "
+        f"agy {styled_value(format_count(saved['agy']), ANSI_MAGENTA, color)}  "
+        f"total {styled_value(format_count(saved['total']), ANSI_BOLD, color)}"
     )
 
 
-def emit_echo(result: ProcessResult, stdout: TextIO) -> None:
+def emit_echo(
+    result: ProcessResult,
+    stdout: TextIO,
+    *,
+    env: dict[str, str] | None = None,
+    color: bool | None = None,
+) -> None:
     if not result.turns:
         return
+    use_color = color_echo_enabled(stdout, env) if color is None else color
     for turn in result.turns:
         turn_sources = [
             source
@@ -786,7 +1184,23 @@ def emit_echo(result: ProcessResult, stdout: TextIO) -> None:
             and source.get("turn_id") == turn.get("turn_id")
             and source.get("turn_event_seq") == turn.get("event_seq")
         ]
-        print(format_echo_line(turn, turn_sources), file=stdout, flush=True)
+        print(format_echo_line(turn, turn_sources, color=use_color), file=stdout, flush=True)
+
+
+def build_telemetry_storage(
+    telemetry_dir: Path,
+    *,
+    env: dict[str, str],
+    rotate_bytes: int | None = None,
+    retention_days: int | None = None,
+    rotation_enabled: bool | None = None,
+) -> TelemetryStorage:
+    return TelemetryStorage(
+        telemetry_dir,
+        rotate_bytes=default_rotate_bytes(env) if rotate_bytes is None else rotate_bytes,
+        retention_days=default_retention_days(env) if retention_days is None else retention_days,
+        rotation_enabled=default_rotation_enabled(env) if rotation_enabled is None else rotation_enabled,
+    )
 
 
 def run_once(
@@ -799,6 +1213,9 @@ def run_once(
     env: dict[str, str] | None = None,
     stdout: TextIO | None = None,
     echo: bool | None = None,
+    rotate_bytes: int | None = None,
+    retention_days: int | None = None,
+    rotation_enabled: bool | None = None,
 ) -> ProcessResult:
     env = env or os.environ
     stdout = stdout or sys.stdout
@@ -809,7 +1226,13 @@ def run_once(
     local_mcp_ledger_path = local_mcp_ledger_path or Path(DEFAULT_LOCAL_MCP_LEDGER)
     local_ledger = LocalLedgerIndex(local_mcp_ledger_path)
     files = session_files if session_files is not None else session_files_from_glob(sessions_glob or default_sessions_glob(env))
-    ledger = JsonlLedger(telemetry_dir)
+    ledger = build_telemetry_storage(
+        telemetry_dir,
+        env=env,
+        rotate_bytes=rotate_bytes,
+        retention_days=retention_days,
+        rotation_enabled=rotation_enabled,
+    )
     combined = ProcessResult()
     for session_file in files:
         result = process_session_file(session_file, local_ledger)
@@ -817,7 +1240,7 @@ def run_once(
         combined.extend(result)
         should_echo = echo if echo is not None else echo_enabled(env)
         if should_echo:
-            emit_echo(result, stdout)
+            emit_echo(result, stdout, env=env)
     if not files or not combined.events:
         fallback_events = parse_tui_log_lifecycle(tui_log_path or default_tui_log(env))
         fallback_result = ProcessResult(events=fallback_events)
@@ -836,12 +1259,21 @@ def watch(
     stdout: TextIO,
     env: dict[str, str] | None = None,
     echo: bool | None = None,
+    rotate_bytes: int | None = None,
+    retention_days: int | None = None,
+    rotation_enabled: bool | None = None,
 ) -> None:
     env = env or os.environ
     if not capture_enabled(env):
         return
 
-    ledger = JsonlLedger(telemetry_dir)
+    ledger = build_telemetry_storage(
+        telemetry_dir,
+        env=env,
+        rotate_bytes=rotate_bytes,
+        retention_days=retention_days,
+        rotation_enabled=rotation_enabled,
+    )
     local_ledger = LocalLedgerIndex(local_mcp_ledger_path)
     processors: dict[Path, SessionProcessor] = {}
     offsets: dict[Path, int] = {}
@@ -863,6 +1295,7 @@ def watch(
             if size == offsets[session_file]:
                 continue
 
+            local_ledger.refresh_if_changed()
             with session_file.open("r", encoding="utf-8") as handle:
                 handle.seek(offsets[session_file])
                 chunk = handle.read()
@@ -877,7 +1310,7 @@ def watch(
             seqs[session_file] += len(lines)
             ledger.append_result(result)
             if should_echo:
-                emit_echo(result, stdout)
+                emit_echo(result, stdout, env=env)
 
         time.sleep(poll_interval)
 
@@ -893,6 +1326,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--echo", action="store_true", help="Print compact post-turn telemetry lines.")
     parser.add_argument("--poll-interval", type=float, default=1.0, help="Watch poll interval in seconds.")
     parser.add_argument("--from-start", action="store_true", help="When watching, replay existing file contents before following appends.")
+    parser.add_argument("--rotate-bytes", type=int, default=None, help="Rotate active telemetry ledgers at this byte size; defaults to CODEX_TELEMETRY_ROTATE_BYTES or 25000000.")
+    parser.add_argument("--retention-days", type=int, default=None, help="Delete compressed telemetry archives older than this many days; defaults to CODEX_TELEMETRY_RETENTION_DAYS or 90. Use 0 to keep archives.")
+    parser.add_argument("--no-rotation", action="store_true", help="Disable active telemetry ledger rotation.")
+    parser.add_argument("--compact-now", action="store_true", help="Rotate oversized active telemetry ledgers, run archive retention cleanup, and exit.")
     return parser.parse_args(argv)
 
 
@@ -904,6 +1341,19 @@ def main(argv: list[str] | None = None, stdout: TextIO | None = None) -> int:
     sessions_glob = args.sessions_glob or default_sessions_glob(env)
     session_files = [Path(path) for path in args.session_file] if args.session_file else None
     echo = args.echo or echo_enabled(env)
+    rotate_bytes = args.rotate_bytes
+    retention_days = args.retention_days
+    rotation_enabled = False if args.no_rotation else None
+
+    if args.compact_now:
+        build_telemetry_storage(
+            telemetry_dir,
+            env=env,
+            rotate_bytes=rotate_bytes,
+            retention_days=retention_days,
+            rotation_enabled=rotation_enabled,
+        ).compact_now()
+        return 0
 
     if args.once:
         run_once(
@@ -915,6 +1365,9 @@ def main(argv: list[str] | None = None, stdout: TextIO | None = None) -> int:
             env=env,
             stdout=stdout,
             echo=echo,
+            rotate_bytes=rotate_bytes,
+            retention_days=retention_days,
+            rotation_enabled=rotation_enabled,
         )
         return 0
 
@@ -927,6 +1380,9 @@ def main(argv: list[str] | None = None, stdout: TextIO | None = None) -> int:
         stdout=stdout,
         env=env,
         echo=echo,
+        rotate_bytes=rotate_bytes,
+        retention_days=retention_days,
+        rotation_enabled=rotation_enabled,
     )
     return 0
 

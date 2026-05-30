@@ -5,8 +5,8 @@ This repo contains a local Ollama MCP server for Codex-style workflows.
 ## Working Rules
 
 - Do not commit `.venv/`, `__pycache__/`, or local evaluation output files.
-- Keep the default code model as `qwen2.5-coder:7b-instruct-q5_K_M` unless the user explicitly asks to change it.
-- Preserve the 8 GB VRAM guardrails: `num_ctx=4096` by default, `6144` only after `ollama ps` shows `100% GPU`.
+- Keep the default code model as `qwen3.5:9b` (which has been verified as superior in accuracy and equal/better in latency in comparative benchmarking suites).
+- Preserve the 8 GB VRAM guardrails: `num_ctx=4096` by default, `6144` only after `ollama ps` shows `100% GPU`. The deterministic routing threshold is set to `4000` tokens: payloads below 4k are processed fully locally on Qwen 3.5 9B; payloads above 4k route to Gemini 3.5 Flash (High) to prevent VRAM thrashing and CPU offloads.
 - Keep GPU tuning outside `server.py`; server tools may read telemetry but should not mutate GPU clocks, voltage, fan curves, or power limits.
 - Treat local model output as compression or second-opinion context, not as final authority.
 
